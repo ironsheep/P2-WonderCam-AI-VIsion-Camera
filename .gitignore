@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Vendor reference material - port FROM it, never commit it (see CLAUDE.md)
+REF-NO-COMMIT/
+
+# macOS host cruft (shared filesystem)
+.DS_Store
+.devcontainer/pnut-ts-linux-arm64-015500.zip
+.devcontainer/docker-compose.override.yml
+/.devcontainer/.history
+/.claude

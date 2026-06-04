@@ -1,0 +1,10 @@
+version: '3.8'
+
+services:
+  dev:
+    image: mcr.microsoft.com/devcontainers/javascript-node:24-bookworm
+    volumes:
+      - ..:/workspaces/P2-WonderCam-AI-VIsion-Camera:cached
+    command: sleep infinity
+    # Note: features, postCreateCommand, extensions, and settings
+    # are handled in devcontainer.json, not here
