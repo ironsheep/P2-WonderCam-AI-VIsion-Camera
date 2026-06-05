@@ -1,4 +1,4 @@
-{Spin2_v50}
+{Spin2_v45}
 '' =================================================================================================
 ''
 ''   File....... isp_wondercam.spin2
@@ -12,23 +12,25 @@
 ''
 '' =================================================================================================
 
-{{
+{
   Two-layer driver for the WonderCam (Kendryte K210 + OV2640) I2C smart camera.
-  This file currently carries the device register/memory map as named constants
-  (plan section 2). Transport, system control, and the per-application API land
-  in later tasks.
+  This file carries the full two-layer driver: the raw readReg/writeReg transport
+  and system control at the bottom, under the high-level 11-application API
+  (face/object/classification/feature/color/line/AprilTag/QR/barcode/number/landmark)
+  layered on top, plus the device register/memory map as named constants.
 
   The map is transcribed from DOCs/research/WONDERCAM-THEORY-OF-OPERATION.md
   section 4. Constants flagged "bring-up L#" are confirmed/corrected on real
-  hardware by the bring-up playbook (see the CON { tunable } block at the end).
-}}
+  hardware by the bring-up playbook (see the CON tunable block near the end).
+}
 
-con { driver identity }
+con ' ---- Driver Identity ----
 
   VERSION = 0_01_00                                            ' driver version 0.1.0 (MM_mm_pp; '_' are digit separators)
 
 
-con { driver result codes }
+con ' ---- Driver Result Codes ----
+  {Spin2_Doc_CON}
 
   E_OK       = 0                                               ' success (read/write also return a byte count >= 0)
   E_NAK      = -1                                              ' device did not acknowledge
@@ -37,14 +39,14 @@ con { driver result codes }
   E_NOTFOUND = -4                                              ' requested id/index not present in the latched results this frame
 
 
-con { I2C device addressing }
+con ' ---- I2C Device Addressing ----
 
   CAM_ADDR_7BIT = $32                                          ' WonderCam 7-bit slave address (code-confirmed; PDF omits - bring-up L0)
   CAM_ADDR_WR   = CAM_ADDR_7BIT << 1                           ' = $64, address byte for write transactions
   CAM_ADDR_RD   = CAM_ADDR_WR | 1                              ' = $65, address byte for read transactions
 
 
-con { system registers - the only writable registers on the device }
+con ' ---- System Registers ----
 
   REG_FW_VERSION = $0000                                       ' R   16 ASCII bytes - firmware version string (e.g. "v0.6.5")
   REG_LIGHT      = $0030                                       ' RW   1 byte        - fill light: 1 = on, 0 = off
@@ -53,8 +55,12 @@ con { system registers - the only writable registers on the device }
   FW_VERSION_LEN = 16                                          ' REG_FW_VERSION payload width (ASCII, NOT null-terminated)
   SYS_REG_LEN    = 1                                           ' REG_LIGHT / REG_FUNC are single-byte registers
 
+  LIGHT_ON       = 1                                           ' REG_LIGHT value to turn the fill light on
+  LIGHT_OFF      = 0                                           ' REG_LIGHT value to turn the fill light off
 
-con { application function numbers - device APPLICATION enum order }
+
+con ' ---- Application Function Numbers ----
+  {Spin2_Doc_CON}
 
   #0, FUNC_NONE, FUNC_FACE, FUNC_OBJECT, FUNC_CLASSIFY, FUNC_FEATURE, FUNC_COLOR, FUNC_LINE, FUNC_APRILTAG, FUNC_QRCODE, FUNC_BARCODE, FUNC_NUMBER, FUNC_LANDMARK
 
@@ -63,7 +69,7 @@ con { application function numbers - device APPLICATION enum order }
   ' FUNC_COLOR (5), FUNC_NUMBER (10), FUNC_LANDMARK (11) are code-derived; confirm vs firmware at bring-up L4/L5.
 
 
-con { per-application result-region base addresses }
+con ' ---- Per-Application Result-Region Base Addresses ----
 
   BASE_FACE     = $0400
   BASE_OBJECT   = $0800
@@ -78,7 +84,7 @@ con { per-application result-region base addresses }
   BASE_APRILTAG = $1E00
 
 
-con { result-region layout - summary at BASE, detail/payload at BASE + DETAIL_OFFS }
+con ' ---- Result-Region Layout ----
 
   DETAIL_OFFS       = $30                                      ' = 48; detail base = BASE + DETAIL_OFFS
   SUMM_SIZE_STD     = 48                                       ' updateResult summary read size: most modes
@@ -91,7 +97,7 @@ con { result-region layout - summary at BASE, detail/payload at BASE + DETAIL_OF
   PROB_DIVISOR      = 10000                                    ' raw prob / PROB_DIVISOR -> 0.0 .. 1.0
 
 
-con { summary-header byte offsets - DETECTION shape (face/object/color/line/tag) }
+con ' ---- Summary-Header Offsets - Detection Shape ----
 
   SUMM_FUNC_ECHO      = 0                                      ' byte[0] = function-echo / refresh marker
   SUMM_COUNT          = 1                                      ' byte[1] = primary detection count
@@ -103,20 +109,20 @@ con { summary-header byte offsets - DETECTION shape (face/object/color/line/tag)
   FACE_ID_UNLEARNED   = $FF                                    ' id-list sentinel marking an unlearned (no-id) face
 
 
-con { summary-header byte offsets - CLASSIFICATION shape (classify/feature/number/landmark) }
+con ' ---- Summary-Header Offsets - Classification Shape ----
 
   SUMM_CLASS_TOPID = 1                                         ' byte[1] = argmax id (NOT a count)
   SUMM_CLASS_PROB  = 2                                         ' uint16 LE at bytes[2..3] = max prob (/ PROB_DIVISOR)
 
 
-con { QR / barcode payload layout }
+con ' ---- QR / Barcode Payload Layout ----
 
   QR_LEN_OFFS  = $20                                           ' uint16 LE payload length at BASE + 0x20
   QR_DATA_OFFS = $30                                           ' payload at BASE + 0x30
   QR_DATA_MAX  = 400                                           ' max payload bytes
 
 
-con { detail-record field offsets - box record (face/object/color), 16 B (8 used) }
+con ' ---- Detail-Record Offsets - Box Record ----
 
   REC_X = 0                                                    ' int16  x (origin or center, signed)
   REC_Y = 2                                                    ' int16  y (signed)
@@ -124,7 +130,7 @@ con { detail-record field offsets - box record (face/object/color), 16 B (8 used
   REC_H = 6                                                    ' uint16 height
 
 
-con { detail-record field offsets - line record, 16 B (12 used) }
+con ' ---- Detail-Record Offsets - Line Record ----
 
   LINE_START_X = 0                                             ' int16
   LINE_START_Y = 2                                             ' int16
@@ -139,7 +145,7 @@ con { detail-record field offsets - line record, 16 B (12 used) }
   LINE_OFFSET_CENTER = 160                                     ' frame-center column (half of the 320 px frame width)
 
 
-con { detail-record field offsets - AprilTag record, 32 B }
+con ' ---- Detail-Record Offsets - AprilTag Record ----
 
   TAG_X  = 0                                                   ' int16  center x
   TAG_Y  = 2                                                   ' int16  center y
@@ -153,12 +159,13 @@ con { detail-record field offsets - AprilTag record, 32 B }
   TAG_ZR = 28                                                  ' float  Z rotation
 
 
-con { shared result-record STRUCT types - the decoded form filled by the per-application API }
+con ' ---- Shared Result-Record STRUCT Types ----
+  {Spin2_Doc_CON}
 
   ' One definition each, shared by the spatial/classification API (later tasks), the demo views,
   ' and the regression top - never re-declared per consumer. Defined in a CON block, so they are
   ' auto-exported to parent objects (Spin2 v49+); a parent imports them as e.g. "wc.spatial_result_t".
-  ' Requires the {Spin2_v50} directive at the top of this file (STRUCT needs v45+).
+  ' Requires the {Spin2_v45} directive at the top of this file (STRUCT needs v45+).
   '
   ' Field widths and order mirror the device record byte layouts exactly (theory-of-operation
   ' section 4.4), so the API can bulk-read a record straight into the struct: the P2 is
@@ -177,7 +184,7 @@ con { shared result-record STRUCT types - the decoded form filled by the per-app
   STRUCT tag_result_t(WORD x, WORD y, WORD w, WORD h, LONG x_t, LONG x_r, LONG y_t, LONG y_r, LONG z_t, LONG z_r)  ' AprilTag: 32 B, 6 float pose LONGs (TAG_* offsets)
 
 
-con { FR-7 tunable - hardware-UNVERIFIED defaults, corrected in ONE place after bring-up }
+con ' ---- FR-7 Tunable Defaults ----
 
   ' Each default is the code-authoritative reading from the theory of operation; the bring-up
   ' playbook confirms or corrects each on real hardware before the high-level API is trusted.
@@ -188,7 +195,7 @@ con { FR-7 tunable - hardware-UNVERIFIED defaults, corrected in ONE place after 
   TAG_REC_STRIDE = 32                                          ' AprilTag per-record advance: 32 (PDF), NOT vendor 0x32=50 typo - bring-up L5
 
 
-con { setMode() echo-poll bound - mirrors vendor changeFunc() (WonderCam.cpp:56-72) }
+con ' ---- setMode() Echo-Poll Bound ----
 
   ' The on-device model can take seconds to swap; setMode() writes REG_FUNC then polls until the
   ' read-back echo matches, bounded so a non-responsive device returns an error instead of hanging.
@@ -197,30 +204,33 @@ con { setMode() echo-poll bound - mirrors vendor changeFunc() (WonderCam.cpp:56-
   MODE_POLL_MAX  = 80                                          ' max polls before giving up (~ 50 + 80*50 = 4050 ms worst case)
 
 
-obj
+obj ' ---- Child Objects ----
 
   i2c : "isp_i2c_singleton"                                    ' low-level I2C; driver owns/configures this dedicated bus (see start()) - bus locking deferred (PUNCH-LIST)
 
 
-var { per-instance driver state }
+var ' ---- Per-Instance Driver State ----
 
   byte  modeActive                                            ' last function id read from the device (cached by currentMode/updateResult)
   byte  summBuffer[SUMM_SIZE_CLASS]                           ' active-mode summary, refreshed by updateResult(); read by the per-application API
 
 
 pub null()
-
-'' This is not a top-level object
+'' This is not a top-level object.
+''
 
 
 pub start(sclPin, sdaPin, busKHz, pullup) : status
-
 '' Configure the dedicated I2C bus this driver owns and probe for the camera.
-'' -- busKHz   : 100 (standard), 400 (full), 1000 (fast)
-'' -- pullup   : i2c.PU_NONE / PU_1K5 / PU_3K3 / PU_15K (high-drive selection)
-'' -- returns E_OK if the camera acknowledges its address, E_NAK if absent
-''    (allow the camera's power-on boot to finish before calling start)
-'' NOTE: this driver owns this bus exclusively - no bus lock in v0.1.0 (shared-bus locking deferred, see PUNCH-LIST)
+''
+'' @param sclPin - I2C clock pin number
+'' @param sdaPin - I2C data pin number
+'' @param busKHz - bus speed: 100 (standard), 400 (full), 1000 (fast)
+'' @param pullup - pull-up selection: i2c.PU_NONE / PU_1K5 / PU_3K3 / PU_15K (high-drive)
+'' @returns status - E_OK if the camera acknowledges its address, E_NAK if absent
+''
+'' Allow the camera's power-on boot to finish before calling start. This driver owns this
+'' bus exclusively - no bus lock in v0.1.0 (shared-bus locking deferred, see PUNCH-LIST).
 
   i2c.setup(sclPin, sdaPin, busKHz, pullup)
   modeActive := FUNC_NONE                                     ' nothing read yet
@@ -231,43 +241,54 @@ pub start(sclPin, sdaPin, busKHz, pullup) : status
 
 
 pub stop() : status
-
-'' Release the I2C bus. The driver holds no cog or other resources, so this only
-'' forms a STOP condition to leave the lines in their idle-high state.
+'' Release the I2C bus.
+''
+'' @returns status - always E_OK
+''
+'' The driver holds no cog or other resources, so this only forms a STOP condition to
+'' leave the lines in their idle-high state.
 
   i2c.stop()
   status := E_OK
 
 
 pub firmwareVersion(pStr) : status
-
 '' Read the FW_VERSION_LEN-byte ASCII firmware-version string into pStr.
-'' -- pStr must point at a buffer of at least FW_VERSION_LEN bytes (NOT null-terminated by the device)
-'' -- returns the byte count (FW_VERSION_LEN) on success, or E_NAK
+''
+'' @param pStr - buffer of at least FW_VERSION_LEN bytes (NOT null-terminated by the device)
+'' @returns status - the byte count (FW_VERSION_LEN) on success, or E_NAK
 
   status := readFromAddr(REG_FW_VERSION, pStr, FW_VERSION_LEN)
 
 
 pub setLed(bEnable) : status | onOff
-
 '' Turn the camera's fill light on (bEnable nonzero) or off (bEnable zero).
-'' -- returns the byte count (SYS_REG_LEN) on success, or E_NAK
+''
+'' @param bEnable - nonzero turns the fill light on, zero turns it off
+'' @returns status - the byte count (SYS_REG_LEN) on success, or E_NAK
 
-  onOff := 0
+' Local Variables:
+' @local onOff - REG_LIGHT value written to the device (LIGHT_OFF / LIGHT_ON)
+
+  onOff := LIGHT_OFF
   if bEnable
-    onOff := 1
+    onOff := LIGHT_ON
   status := writeToAddr(REG_LIGHT, @onOff, SYS_REG_LEN)
 
 
 pub setMode(funcId) : status | polls
-
 '' Select the active vision application and confirm the device adopted it.
-'' Writes REG_FUNC then polls the read-back echo (the model swap can take seconds),
-'' bounded by MODE_POLL_MAX so an unresponsive device returns an error, never hangs.
-'' -- returns E_OK once the echo matches, E_ARG if funcId is out of range,
-''    E_NAK if the write was not acknowledged, E_MODE if the echo never matched in time
-'' Mirrors vendor changeFunc() (WonderCam.cpp:56-72). Keep this (slow) call separate
-'' from updateResult() (fast poll) per spec FR-2.
+''
+'' @param funcId - application function number (FUNC_FIRST..FUNC_LAST)
+'' @returns status - E_OK once the echo matches, E_ARG if funcId is out of range, E_NAK if the write was not acknowledged, E_MODE if the echo never matched in time
+''
+'' Writes REG_FUNC then polls the read-back echo (the model swap can take seconds), bounded
+'' by MODE_POLL_MAX so an unresponsive device returns an error, never hangs. Mirrors vendor
+'' changeFunc() (WonderCam.cpp:56-72). Keep this (slow) call separate from updateResult()
+'' (fast poll) per spec FR-2.
+
+' Local Variables:
+' @local polls - mode-echo poll counter
 
   if funcId < FUNC_FIRST or funcId > FUNC_LAST
     status := E_ARG
@@ -288,9 +309,12 @@ pub setMode(funcId) : status | polls
 
 
 pub currentMode() : modeOrErr | regByte
-
 '' Read REG_FUNC to learn the device's active function and cache it.
-'' -- returns the function id (FUNC_NONE..FUNC_LAST) on success, or E_NAK
+''
+'' @returns modeOrErr - the function id (FUNC_NONE..FUNC_LAST) on success, or E_NAK
+
+' Local Variables:
+' @local regByte - single REG_FUNC byte read back from the device
 
   regByte := 0
   if readFromAddr(REG_FUNC, @regByte, SYS_REG_LEN) >= E_OK
@@ -301,11 +325,16 @@ pub currentMode() : modeOrErr | regByte
 
 
 pub updateResult() : status | base, summSize
-
 '' Refresh the cached summary for the device's active mode (the fast poll path, spec FR-2).
+''
+'' @returns status - the summary byte count (>= 0) on success, E_NAK on bus failure, E_MODE if no mode is active (FUNC_NONE)
+''
 '' Reads REG_FUNC, then reads that mode's summary region into summBuffer at the mode's summary
 '' size. The per-application API (later tasks) decodes counts/ids from summBuffer.
-'' -- returns the summary byte count (>= 0) on success, E_NAK on bus failure, E_MODE if no mode is active (FUNC_NONE)
+
+' Local Variables:
+' @local base - result-region base address for the active mode
+' @local summSize - summary read size for the active mode
 
   status := currentMode()                                     ' refreshes modeActive; returns mode id or E_NAK
   if status >= E_OK
@@ -317,25 +346,33 @@ pub updateResult() : status | base, summSize
 
 
 pub readReg(regAddr, pBuf, byteCount) : status
-
 '' Raw read: byteCount bytes from any 16-bit register regAddr into pBuf (spec FR-1).
-'' A thin passthrough over the transport so every device register stays reachable
-'' independent of the high-level wrappers.
-'' -- returns the byte count (>= 0) on success, or the transport error code unchanged (E_NAK)
+''
+'' @param regAddr - 16-bit device register start address
+'' @param pBuf - destination buffer pointer
+'' @param byteCount - number of bytes to read
+'' @returns status - the byte count (>= 0) on success, or the transport error code unchanged (E_NAK)
+''
+'' A thin passthrough over the transport so every device register stays reachable independent
+'' of the high-level wrappers.
 
   status := readFromAddr(regAddr, pBuf, byteCount)             ' pass the transport result through verbatim (authoring guide 5.6)
 
 
 pub writeReg(regAddr, pBuf, byteCount) : status
-
 '' Raw write: byteCount bytes from pBuf to any 16-bit register regAddr (spec FR-1).
+''
+'' @param regAddr - 16-bit device register start address
+'' @param pBuf - source buffer pointer
+'' @param byteCount - number of bytes to write
+'' @returns status - the byte count (>= 0) on success, or the transport error code unchanged (E_NAK)
+''
 '' A thin passthrough over the transport (see readReg).
-'' -- returns the byte count (>= 0) on success, or the transport error code unchanged (E_NAK)
 
   status := writeToAddr(regAddr, pBuf, byteCount)             ' pass the transport result through verbatim (authoring guide 5.6)
 
 
-con { high-level spatial-detection API (face / object / color / line / AprilTag) - spec FR-3 }
+con ' ---- High-Level Spatial-Detection API ----
 
   ' All accessors read the summary latched by the most recent updateResult() (call it first).
   ' Return model (spec FR-6): counts and get* return a non-negative success value or a NEGATIVE
@@ -346,22 +383,25 @@ con { high-level spatial-detection API (face / object / color / line / AprilTag)
 
 
 pub anyFaceDetected() : bFlag
-
-'' TRUE if the latched face summary reports one or more faces (FALSE if not in face mode).
+'' Report whether the latched face summary contains one or more faces.
+''
+'' @returns bFlag - TRUE if one or more faces, FALSE if none or not in face mode
 
   bFlag := anyDetectedIn(FUNC_FACE)
 
 
 pub numFaces() : countOrErr
-
-'' Total detected faces, or E_MODE if face mode is not active.
+'' Report the total number of detected faces.
+''
+'' @returns countOrErr - face count, or E_MODE if face mode is not active
 
   countOrErr := numDetectedIn(FUNC_FACE)
 
 
 pub numLearned() : countOrErr
-
-'' Learned (id-bearing) faces, or E_MODE if face mode is not active.
+'' Report the number of learned (id-bearing) faces.
+''
+'' @returns countOrErr - learned-face count, or E_MODE if face mode is not active
 
   countOrErr := E_MODE
   if modeActive == FUNC_FACE
@@ -369,8 +409,9 @@ pub numLearned() : countOrErr
 
 
 pub numUnlearned() : countOrErr
-
-'' Unlearned (no-id) faces, or E_MODE if face mode is not active.
+'' Report the number of unlearned (no-id) faces.
+''
+'' @returns countOrErr - unlearned-face count, or E_MODE if face mode is not active
 
   countOrErr := E_MODE
   if modeActive == FUNC_FACE
@@ -380,8 +421,10 @@ pub numUnlearned() : countOrErr
 
 
 pub faceIdDetected(id) : bFlag
-
-'' TRUE if a face with the given id is in the latched results (FALSE if not in face mode).
+'' Report whether a face with the given id is in the latched results.
+''
+'' @param id - face id to look for
+'' @returns bFlag - TRUE if the id is present, FALSE if absent or not in face mode
 
   bFlag := FALSE
   if modeActive == FUNC_FACE
@@ -389,9 +432,14 @@ pub faceIdDetected(id) : bFlag
 
 
 pub getFaceById(id, pRec) : status | slot
-
 '' Fill the caller's spatial_result_t at pRec with the first face matching id.
-'' -- E_OK on success, E_MODE wrong mode, E_NOTFOUND no such id, E_NAK bus failure
+''
+'' @param id - face id to fetch
+'' @param pRec - destination spatial_result_t pointer
+'' @returns status - E_OK on success, E_MODE wrong mode, E_NOTFOUND no such id, E_NAK bus failure
+
+' Local Variables:
+' @local slot - matched id-list / detail-record slot
 
   status := guardMode(FUNC_FACE)
   if status == E_OK
@@ -403,9 +451,14 @@ pub getFaceById(id, pRec) : status | slot
 
 
 pub getUnlearnedFace(index, pRec) : status | slot
-
 '' Fill the caller's spatial_result_t at pRec with the index-th (0-based) unlearned face.
-'' -- E_OK, E_ARG (index < 0), E_MODE, E_NOTFOUND (fewer than index+1 unlearned), E_NAK
+''
+'' @param index - 0-based unlearned-face index
+'' @param pRec - destination spatial_result_t pointer
+'' @returns status - E_OK, E_ARG (index < 0), E_MODE, E_NOTFOUND (fewer than index+1 unlearned), E_NAK
+
+' Local Variables:
+' @local slot - matched id-list / detail-record slot
 
   status := E_ARG
   if index >= 0
@@ -421,22 +474,26 @@ pub getUnlearnedFace(index, pRec) : status | slot
 
 
 pub anyObject() : bFlag
-
-'' TRUE if the latched object summary reports one or more objects (FALSE if not in object mode).
+'' Report whether the latched object summary contains one or more objects.
+''
+'' @returns bFlag - TRUE if one or more objects, FALSE if none or not in object mode
 
   bFlag := anyDetectedIn(FUNC_OBJECT)
 
 
 pub numObjects() : countOrErr
-
-'' Total detected objects, or E_MODE if object mode is not active.
+'' Report the total number of detected objects.
+''
+'' @returns countOrErr - object count, or E_MODE if object mode is not active
 
   countOrErr := numDetectedIn(FUNC_OBJECT)
 
 
 pub objectIdDetected(id) : bFlag
-
-'' TRUE if an object with the given id is in the latched results (FALSE if not in object mode).
+'' Report whether an object with the given id is in the latched results.
+''
+'' @param id - object id to look for
+'' @returns bFlag - TRUE if the id is present, FALSE if absent or not in object mode
 
   bFlag := FALSE
   if modeActive == FUNC_OBJECT
@@ -444,8 +501,10 @@ pub objectIdDetected(id) : bFlag
 
 
 pub numObjectsOfId(id) : countOrErr
-
-'' Count of detected objects bearing id, or E_MODE if object mode is not active.
+'' Count the detected objects bearing the given id.
+''
+'' @param id - object id to count
+'' @returns countOrErr - count of matching objects, or E_MODE if object mode is not active
 
   countOrErr := E_MODE
   if modeActive == FUNC_OBJECT
@@ -453,9 +512,15 @@ pub numObjectsOfId(id) : countOrErr
 
 
 pub getObject(id, index, pRec) : status | slot
-
 '' Fill the caller's spatial_result_t at pRec with the index-th (0-based) object matching id.
-'' -- E_OK, E_ARG (index < 0), E_MODE, E_NOTFOUND, E_NAK
+''
+'' @param id - object id to fetch
+'' @param index - 0-based occurrence among objects bearing id
+'' @param pRec - destination spatial_result_t pointer
+'' @returns status - E_OK, E_ARG (index < 0), E_MODE, E_NOTFOUND, E_NAK
+
+' Local Variables:
+' @local slot - matched id-list / detail-record slot
 
   status := E_ARG
   if index >= 0
@@ -472,22 +537,26 @@ pub getObject(id, index, pRec) : status | slot
 
 
 pub anyColor() : bFlag
-
-'' TRUE if the latched color summary reports one or more colors (FALSE if not in color mode).
+'' Report whether the latched color summary contains one or more colors.
+''
+'' @returns bFlag - TRUE if one or more colors, FALSE if none or not in color mode
 
   bFlag := anyDetectedIn(FUNC_COLOR)
 
 
 pub numColors() : countOrErr
-
-'' Number of detected colors, or E_MODE if color mode is not active.
+'' Report the number of detected colors.
+''
+'' @returns countOrErr - color count, or E_MODE if color mode is not active
 
   countOrErr := numDetectedIn(FUNC_COLOR)
 
 
 pub colorIdDetected(id) : bFlag
-
-'' TRUE if a color with the given id is in the latched results (FALSE if not in color mode).
+'' Report whether a color with the given id is in the latched results.
+''
+'' @param id - color id to look for
+'' @returns bFlag - TRUE if the id is present, FALSE if absent or not in color mode
 
   bFlag := FALSE
   if modeActive == FUNC_COLOR
@@ -495,9 +564,14 @@ pub colorIdDetected(id) : bFlag
 
 
 pub getColor(id, pRec) : status | slot
-
 '' Fill the caller's spatial_result_t at pRec with the color matching id.
-'' -- E_OK, E_MODE, E_NOTFOUND, E_NAK
+''
+'' @param id - color id to fetch
+'' @param pRec - destination spatial_result_t pointer
+'' @returns status - E_OK, E_MODE, E_NOTFOUND, E_NAK
+
+' Local Variables:
+' @local slot - matched id-list / detail-record slot
 
   status := guardMode(FUNC_COLOR)
   if status == E_OK
@@ -509,22 +583,26 @@ pub getColor(id, pRec) : status | slot
 
 
 pub anyLine() : bFlag
-
-'' TRUE if the latched line summary reports one or more lines (FALSE if not in line mode).
+'' Report whether the latched line summary contains one or more lines.
+''
+'' @returns bFlag - TRUE if one or more lines, FALSE if none or not in line mode
 
   bFlag := anyDetectedIn(FUNC_LINE)
 
 
 pub numLines() : countOrErr
-
-'' Number of detected lines, or E_MODE if line mode is not active.
+'' Report the number of detected lines.
+''
+'' @returns countOrErr - line count, or E_MODE if line mode is not active
 
   countOrErr := numDetectedIn(FUNC_LINE)
 
 
 pub lineIdDetected(id) : bFlag
-
-'' TRUE if a line with the given id is in the latched results (FALSE if not in line mode).
+'' Report whether a line with the given id is in the latched results.
+''
+'' @param id - line id to look for
+'' @returns bFlag - TRUE if the id is present, FALSE if absent or not in line mode
 
   bFlag := FALSE
   if modeActive == FUNC_LINE
@@ -532,10 +610,17 @@ pub lineIdDetected(id) : bFlag
 
 
 pub getLine(id, pRec) : status | slot, angle, offset
-
 '' Fill the caller's line_result_t at pRec with the line matching id: raw endpoints, plus
 '' angle and offset NORMALIZED as the vendor does (kept open for bring-up, theory 5.6).
-'' -- E_OK, E_MODE, E_NOTFOUND, E_NAK
+''
+'' @param id - line id to fetch
+'' @param pRec - destination line_result_t pointer
+'' @returns status - E_OK, E_MODE, E_NOTFOUND, E_NAK
+
+' Local Variables:
+' @local slot - matched id-list / detail-record slot
+' @local angle - sign-extended line angle being normalized
+' @local offset - sign-extended line offset being recentered
 
   status := guardMode(FUNC_LINE)
   if status == E_OK
@@ -558,22 +643,26 @@ pub getLine(id, pRec) : status | slot, angle, offset
 
 
 pub anyTag() : bFlag
-
-'' TRUE if the latched AprilTag summary reports one or more tags (FALSE if not in AprilTag mode).
+'' Report whether the latched AprilTag summary contains one or more tags.
+''
+'' @returns bFlag - TRUE if one or more tags, FALSE if none or not in AprilTag mode
 
   bFlag := anyDetectedIn(FUNC_APRILTAG)
 
 
 pub numTags() : countOrErr
-
-'' Total detected AprilTags, or E_MODE if AprilTag mode is not active.
+'' Report the total number of detected AprilTags.
+''
+'' @returns countOrErr - tag count, or E_MODE if AprilTag mode is not active
 
   countOrErr := numDetectedIn(FUNC_APRILTAG)
 
 
 pub tagIdDetected(id) : bFlag
-
-'' TRUE if a tag with the given id is in the latched results (FALSE if not in AprilTag mode).
+'' Report whether a tag with the given id is in the latched results.
+''
+'' @param id - tag id to look for
+'' @returns bFlag - TRUE if the id is present, FALSE if absent or not in AprilTag mode
 
   bFlag := FALSE
   if modeActive == FUNC_APRILTAG
@@ -581,8 +670,10 @@ pub tagIdDetected(id) : bFlag
 
 
 pub numTagsOfId(id) : countOrErr
-
-'' Count of detected tags bearing id, or E_MODE if AprilTag mode is not active.
+'' Count the detected tags bearing the given id.
+''
+'' @param id - tag id to count
+'' @returns countOrErr - count of matching tags, or E_MODE if AprilTag mode is not active
 
   countOrErr := E_MODE
   if modeActive == FUNC_APRILTAG
@@ -590,10 +681,16 @@ pub numTagsOfId(id) : countOrErr
 
 
 pub getTag(id, index, pRec) : status | slot
-
 '' Fill the caller's tag_result_t at pRec with the index-th (0-based) tag matching id
 '' (x,y,w,h + 6 IEEE-754 float pose LONGs).
-'' -- E_OK, E_ARG (index < 0), E_MODE, E_NOTFOUND, E_NAK
+''
+'' @param id - tag id to fetch
+'' @param index - 0-based occurrence among tags bearing id
+'' @param pRec - destination tag_result_t pointer
+'' @returns status - E_OK, E_ARG (index < 0), E_MODE, E_NOTFOUND, E_NAK
+
+' Local Variables:
+' @local slot - matched id-list / detail-record slot
 
   status := E_ARG
   if index >= 0
@@ -610,7 +707,7 @@ pub getTag(id, index, pRec) : status | slot
         status := fetchRecord(BASE_APRILTAG, slot, TAG_REC_STRIDE, pRec, SIZEOF(tag_result_t))
 
 
-con { high-level classification-style API (classification / feature / number / road-sign / QR / barcode) - spec FR-3 }
+con ' ---- High-Level Classification-Style API ----
 
   ' Classification-shaped modes report an argmax id plus a probability. Probability is returned as a
   ' SCALED INTEGER in 0..PROB_DIVISOR (i.e. raw / 10000 gives 0.0..1.0); a negative value is an error
@@ -622,66 +719,80 @@ con { high-level classification-style API (classification / feature / number / r
 
 
 pub classTopId() : idOrErr
-
-'' Most-probable image-classification id, or E_MODE if classification mode is not active.
+'' Report the most-probable image-classification id.
+''
+'' @returns idOrErr - argmax classification id, or E_MODE if classification mode is not active
 
   idOrErr := topIdIn(FUNC_CLASSIFY)
 
 
 pub classTopProb() : probOrErr
-
-'' Top classification probability (scaled 0..PROB_DIVISOR), or E_MODE if not in classification mode.
+'' Report the top classification probability (scaled 0..PROB_DIVISOR).
+''
+'' @returns probOrErr - scaled probability 0..PROB_DIVISOR, or E_MODE if not in classification mode
 
   probOrErr := topProbIn(FUNC_CLASSIFY)
 
 
 pub classProbOfId(id) : probOrErr
-
-'' Probability (scaled 0..PROB_DIVISOR) of classification id (1-based), or E_MODE / E_ARG.
+'' Report the probability of a specific classification id (1-based).
+''
+'' @param id - 1-based classification id
+'' @returns probOrErr - scaled probability 0..PROB_DIVISOR, or E_MODE / E_ARG
 
   probOrErr := probOfIdIn(FUNC_CLASSIFY, id, SUMM_SIZE_CLASS)
 
 
 pub featureTopId() : idOrErr
-
-'' Most-probable feature-learning id, or E_MODE if feature-learning mode is not active.
+'' Report the most-probable feature-learning id.
+''
+'' @returns idOrErr - argmax feature id, or E_MODE if feature-learning mode is not active
 
   idOrErr := topIdIn(FUNC_FEATURE)
 
 
 pub featureTopProb() : probOrErr
-
-'' Top feature-learning probability (scaled 0..PROB_DIVISOR), or E_MODE if not in feature mode.
+'' Report the top feature-learning probability (scaled 0..PROB_DIVISOR).
+''
+'' @returns probOrErr - scaled probability 0..PROB_DIVISOR, or E_MODE if not in feature mode
 
   probOrErr := topProbIn(FUNC_FEATURE)
 
 
 pub featureProbOfId(id) : probOrErr
-
-'' Probability (scaled 0..PROB_DIVISOR) of feature id (1-based), or E_MODE / E_ARG.
+'' Report the probability of a specific feature id (1-based).
+''
+'' @param id - 1-based feature id
+'' @returns probOrErr - scaled probability 0..PROB_DIVISOR, or E_MODE / E_ARG
 
   probOrErr := probOfIdIn(FUNC_FEATURE, id, SUMM_SIZE_FEATURE)
 
 
 pub numberTopId() : idOrErr
-
-'' Most-probable recognized-number id, or E_MODE if number mode is not active.
+'' Report the most-probable recognized-number id.
+''
+'' @returns idOrErr - argmax number id, or E_MODE if number mode is not active
+''
 '' UNVERIFIED: authored from the Python reference, no vendor C path (bring-up L5).
 
   idOrErr := topIdIn(FUNC_NUMBER)
 
 
 pub numberTopProb() : probOrErr
-
-'' Top number-recognition probability (scaled 0..PROB_DIVISOR), or E_MODE if not in number mode.
+'' Report the top number-recognition probability (scaled 0..PROB_DIVISOR).
+''
+'' @returns probOrErr - scaled probability 0..PROB_DIVISOR, or E_MODE if not in number mode
+''
 '' UNVERIFIED: authored from the Python reference, no vendor C path (bring-up L5).
 
   probOrErr := topProbIn(FUNC_NUMBER)
 
 
 pub landmarkTopId() : idOrErr
-
-'' Most-probable road-sign (landmark) id, or E_MODE if road-sign mode is not active.
+'' Report the most-probable road-sign (landmark) id.
+''
+'' @returns idOrErr - argmax road-sign id, or E_MODE if road-sign mode is not active
+''
 '' UNVERIFIED (bring-up L5): Python-only; the id alone may not distinguish "no sign" from sign id 1 -
 '' gate on landmarkTopProb() confidence and confirm the no-detection sentinel on real hardware.
 
@@ -689,61 +800,72 @@ pub landmarkTopId() : idOrErr
 
 
 pub landmarkTopProb() : probOrErr
-
-'' Top road-sign probability (scaled 0..PROB_DIVISOR), or E_MODE if not in road-sign mode.
+'' Report the top road-sign probability (scaled 0..PROB_DIVISOR).
+''
+'' @returns probOrErr - scaled probability 0..PROB_DIVISOR, or E_MODE if not in road-sign mode
+''
 '' UNVERIFIED: authored from the Python reference, no vendor C path (bring-up L5).
 
   probOrErr := topProbIn(FUNC_LANDMARK)
 
 
 pub qrDetected() : bFlag
-
-'' TRUE if a QR code is decoded in the latched results (FALSE if not in QR mode).
+'' Report whether a QR code is decoded in the latched results.
+''
+'' @returns bFlag - TRUE if a QR code is decoded, FALSE if none or not in QR mode
 
   bFlag := anyDetectedIn(FUNC_QRCODE)
 
 
 pub qrLength() : lenOrErr
-
-'' Decoded QR payload length in bytes, or E_MODE if QR mode is not active.
+'' Report the decoded QR payload length in bytes.
+''
+'' @returns lenOrErr - payload byte length, or E_MODE if QR mode is not active
 
   lenOrErr := payloadLength(FUNC_QRCODE)
 
 
 pub qrData(pBuf) : status
-
-'' Copy the decoded QR payload into pBuf (provide a >= QR_DATA_MAX byte buffer; NOT null-terminated).
-'' -- returns the byte count copied (0 if empty), E_MODE wrong mode, or E_NAK bus failure
+'' Copy the decoded QR payload into pBuf.
+''
+'' @param pBuf - destination buffer of at least QR_DATA_MAX bytes (NOT null-terminated)
+'' @returns status - the byte count copied (0 if empty), E_MODE wrong mode, or E_NAK bus failure
 
   status := readPayload(FUNC_QRCODE, BASE_QRCODE, pBuf)
 
 
 pub barcodeDetected() : bFlag
-
-'' TRUE if a barcode is decoded in the latched results (FALSE if not in barcode mode).
+'' Report whether a barcode is decoded in the latched results.
+''
+'' @returns bFlag - TRUE if a barcode is decoded, FALSE if none or not in barcode mode
 
   bFlag := anyDetectedIn(FUNC_BARCODE)
 
 
 pub barcodeLength() : lenOrErr
-
-'' Decoded barcode payload length in bytes, or E_MODE if barcode mode is not active.
+'' Report the decoded barcode payload length in bytes.
+''
+'' @returns lenOrErr - payload byte length, or E_MODE if barcode mode is not active
 
   lenOrErr := payloadLength(FUNC_BARCODE)
 
 
 pub barcodeData(pBuf) : status
-
-'' Copy the decoded barcode payload into pBuf (provide a >= QR_DATA_MAX byte buffer; NOT null-terminated).
-'' -- returns the byte count copied (0 if empty), E_MODE wrong mode, or E_NAK bus failure
+'' Copy the decoded barcode payload into pBuf.
+''
+'' @param pBuf - destination buffer of at least QR_DATA_MAX bytes (NOT null-terminated)
+'' @returns status - the byte count copied (0 if empty), E_MODE wrong mode, or E_NAK bus failure
 
   status := readPayload(FUNC_BARCODE, BASE_BARCODE, pBuf)
 
 
 pri writeToAddr(regAddr, pBuf, byteCount) : status
-
-'' Write byteCount bytes from pBuf to 16-bit device register regAddr.
-'' -- returns byteCount on success, or E_NAK if the device did not acknowledge
+' Write byteCount bytes from pBuf to 16-bit device register regAddr.
+'
+' @param regAddr - 16-bit device register start address
+' @param pBuf - source buffer pointer
+' @param byteCount - number of bytes to write
+' @returns status - byteCount on success, or E_NAK if the device did not acknowledge
 
   status := E_NAK
   if addrWritePhase(regAddr) == i2c.ACK
@@ -753,11 +875,21 @@ pri writeToAddr(regAddr, pBuf, byteCount) : status
 
 
 pri readFromAddr(regAddr, pBuf, byteCount) : status | remaining, chunk, pDest, nextAddr
-
-'' Read byteCount bytes from 16-bit device register regAddr into pBuf.
-'' -- CHUNK_AUTOINC TRUE  : one continuous sequential read (the normal I2C pattern)
-'' -- CHUNK_AUTOINC FALSE : re-address before each READ_CHUNK-byte chunk (hardware fallback)
-'' -- returns byteCount on success, or E_NAK if the device did not acknowledge
+' Read byteCount bytes from 16-bit device register regAddr into pBuf.
+'
+' @param regAddr - 16-bit device register start address
+' @param pBuf - destination buffer pointer
+' @param byteCount - number of bytes to read
+' @returns status - byteCount on success, or E_NAK if the device did not acknowledge
+'
+' CHUNK_AUTOINC TRUE  : one continuous sequential read (the normal I2C pattern).
+' CHUNK_AUTOINC FALSE : re-address before each READ_CHUNK-byte chunk (hardware fallback).
+'
+' Local Variables:
+' @local remaining - bytes still to read
+' @local chunk - bytes in the current I2C transaction
+' @local pDest - moving write pointer into pBuf
+' @local nextAddr - register address for the next chunk
 
   status := E_NAK
   if CHUNK_AUTOINC
@@ -784,9 +916,10 @@ pri readFromAddr(regAddr, pBuf, byteCount) : status | remaining, chunk, pDest, n
 
 
 pri startRead(regAddr) : ackbit
-
-'' Address-write phase plus repeated start for a read from 16-bit register regAddr.
-'' -- returns i2c.ACK if the device acknowledged the read-address byte
+' Address-write phase plus repeated start for a read from 16-bit register regAddr.
+'
+' @param regAddr - 16-bit device register start address
+' @returns ackbit - i2c.ACK if the device acknowledged the read-address byte
 
   ackbit := addrWritePhase(regAddr)
   if ackbit == i2c.ACK
@@ -795,9 +928,10 @@ pri startRead(regAddr) : ackbit
 
 
 pri addrWritePhase(regAddr) : ackbit
-
-'' I2C start + device write-address + 16-bit register address (mid-transaction, no stop).
-'' -- returns i2c.ACK if the device acknowledged its write-address byte
+' I2C start + device write-address + 16-bit register address (mid-transaction, no stop).
+'
+' @param regAddr - 16-bit device register start address
+' @returns ackbit - i2c.ACK if the device acknowledged its write-address byte
 
   i2c.start()
   ackbit := i2c.write(CAM_ADDR_WR)
@@ -806,8 +940,9 @@ pri addrWritePhase(regAddr) : ackbit
 
 
 pri sendRegAddr(regAddr)
-
-'' Write the 16-bit register address to the bus, byte order per ADDR_LOW_FIRST
+' Write the 16-bit register address to the bus, byte order per ADDR_LOW_FIRST.
+'
+' @param regAddr - 16-bit device register address to transmit
 
   if ADDR_LOW_FIRST
     i2c.write(regAddr & $FF)                                   ' low byte first (code-confirmed default)
@@ -818,11 +953,14 @@ pri sendRegAddr(regAddr)
 
 
 pri summaryReadPlan(mode) : base, summSize
-
-'' Map an active function id to its result-region base address and updateResult() summary size.
-'' -- base 0 means "no result region" (FUNC_NONE or an unmapped id)
-'' Summary sizes mirror vendor updateResult() (WonderCam.cpp:512-549): classification 128,
-'' feature-learning 64, everything else 48.
+' Map an active function id to its result-region base address and updateResult() summary size.
+'
+' @param mode - active function id to map
+' @returns base - result-region base address, or 0 for "no result region" (FUNC_NONE or an unmapped id)
+' @returns summSize - summary read size for the mode
+'
+' Summary sizes mirror vendor updateResult() (WonderCam.cpp:512-549): classification 128,
+' feature-learning 64, everything else 48.
 
   summSize := SUMM_SIZE_STD                                   ' default for the box/payload modes
   case mode
@@ -846,10 +984,13 @@ pri summaryReadPlan(mode) : base, summSize
 
 
 pri guardMode(wantFunc) : status
-
-'' E_OK if the device's last-latched mode (set by updateResult/currentMode) is wantFunc, else E_MODE.
-'' The detection accessors read the cached summary, so they validate against the latched mode -
-'' they do NOT re-read REG_FUNC (that is updateResult's job, kept separate per spec FR-2).
+' Confirm the device's last-latched mode is wantFunc.
+'
+' @param wantFunc - required active function id
+' @returns status - E_OK if the latched mode is wantFunc, else E_MODE
+'
+' The detection accessors read the cached summary, so they validate against the latched mode -
+' they do NOT re-read REG_FUNC (that is updateResult's job, kept separate per spec FR-2).
 
   status := E_MODE
   if modeActive == wantFunc
@@ -857,10 +998,19 @@ pri guardMode(wantFunc) : status
 
 
 pri findIdSlot(listOffs, scanCount, wantId, occurrence) : slot | idx, matchNum
-
-'' Scan scanCount id-list bytes from summBuffer[listOffs] for the occurrence-th (0-based) entry
-'' equal to wantId. Returns its id-list position (the detail-record slot), or -1 if there are
-'' fewer than occurrence+1 matches. A while-loop (not repeat-from) so scanCount == 0 scans nothing.
+' Find the occurrence-th (0-based) id-list entry equal to wantId.
+'
+' @param listOffs - id-list start offset within summBuffer
+' @param scanCount - number of id-list bytes to scan
+' @param wantId - id value to match
+' @param occurrence - 0-based match index to return
+' @returns slot - id-list position (the detail-record slot), or -1 if fewer than occurrence+1 matches
+'
+' A while-loop (not repeat-from) so scanCount == 0 scans nothing.
+'
+' Local Variables:
+' @local idx - id-list scan index
+' @local matchNum - count of matches seen so far
 
   slot     := -1
   matchNum := 0
@@ -875,8 +1025,15 @@ pri findIdSlot(listOffs, scanCount, wantId, occurrence) : slot | idx, matchNum
 
 
 pri countIdMatches(listOffs, scanCount, wantId) : count | idx
+' Count id-list bytes equal to wantId across scanCount entries from summBuffer[listOffs].
+'
+' @param listOffs - id-list start offset within summBuffer
+' @param scanCount - number of id-list bytes to scan
+' @param wantId - id value to match
+' @returns count - number of id-list entries equal to wantId
 
-'' Count id-list bytes equal to wantId across scanCount entries from summBuffer[listOffs].
+' Local Variables:
+' @local idx - id-list scan index
 
   count := 0
   idx   := 0
@@ -887,17 +1044,24 @@ pri countIdMatches(listOffs, scanCount, wantId) : count | idx
 
 
 pri liveScan() : scanCount
-
-'' id-list length for the count-driven modes (color/line/tag): the latched detection count,
-'' bounded by the id-list capacity.
+' Compute the id-list length for the count-driven modes (color/line/tag).
+'
+' @returns scanCount - the latched detection count, bounded by the id-list capacity
 
   scanCount := summBuffer[SUMM_COUNT] <# IDLIST_CAP
 
 
 pri fetchRecord(base, slot, stride, pRec, recLen) : status
-
-'' Read a recLen-byte detail record (record slot at base + DETAIL_OFFS + slot*stride) into pRec.
-'' Normalizes the transport's positive byte count to E_OK; a transport E_NAK passes through.
+' Read a recLen-byte detail record (record slot at base + DETAIL_OFFS + slot*stride) into pRec.
+'
+' @param base - result-region base address
+' @param slot - detail-record slot index
+' @param stride - per-record byte stride
+' @param pRec - destination record pointer
+' @param recLen - record length in bytes
+' @returns status - E_OK on success; a transport E_NAK passes through
+'
+' Normalizes the transport's positive byte count to E_OK.
 
   status := readFromAddr(base + DETAIL_OFFS + slot * stride, pRec, recLen)
   if status >= E_OK
@@ -905,9 +1069,12 @@ pri fetchRecord(base, slot, stride, pRec, recLen) : status
 
 
 pri anyDetectedIn(wantFunc) : bFlag
-
-'' TRUE if wantFunc is the latched mode and its summary count is nonzero, else FALSE.
-'' Shared body of the any* predicates (count-header modes: face/object/color/line/tag).
+' Report whether wantFunc is the latched mode and its summary count is nonzero.
+'
+' @param wantFunc - required active function id
+' @returns bFlag - TRUE if wantFunc is active and its count is nonzero, else FALSE
+'
+' Shared body of the any* predicates (count-header modes: face/object/color/line/tag).
 
   bFlag := FALSE
   if modeActive == wantFunc
@@ -915,26 +1082,34 @@ pri anyDetectedIn(wantFunc) : bFlag
 
 
 pri numDetectedIn(wantFunc) : countOrErr
-
-'' Latched summary detection count for wantFunc, or E_MODE if it is not the active mode.
-'' Shared body of the num* counts (count-header modes).
+' Report the latched summary detection count for wantFunc.
+'
+' @param wantFunc - required active function id
+' @returns countOrErr - the detection count, or E_MODE if wantFunc is not the active mode
+'
+' Shared body of the num* counts (count-header modes).
 
   countOrErr := E_MODE
   if modeActive == wantFunc
     countOrErr := summBuffer[SUMM_COUNT]
 
 
-pri summWord(offset) : value
+pri summWord(offset) : wordVal
+' Read an unsigned 16-bit little-endian value from the latched summary at byte offset.
+'
+' @param offset - byte offset into summBuffer
+' @returns wordVal - the unsigned 16-bit value at that offset
+'
+' (P2 is little-endian and the device payload is little-endian, so WORD reads it directly.)
 
-'' Unsigned 16-bit little-endian value from the latched summary at byte offset.
-'' (P2 is little-endian and the device payload is little-endian, so WORD reads it directly.)
-
-  value := WORD[@summBuffer + offset]
+  wordVal := WORD[@summBuffer + offset]
 
 
 pri topIdIn(wantFunc) : idOrErr
-
-'' Argmax id from the latched classification-style summary, or E_MODE if wantFunc is not active.
+' Read the argmax id from the latched classification-style summary.
+'
+' @param wantFunc - required active function id
+' @returns idOrErr - the argmax id, or E_MODE if wantFunc is not active
 
   idOrErr := E_MODE
   if modeActive == wantFunc
@@ -942,9 +1117,10 @@ pri topIdIn(wantFunc) : idOrErr
 
 
 pri topProbIn(wantFunc) : probOrErr
-
-'' Top probability for wantFunc as a scaled integer 0..PROB_DIVISOR (divide by PROB_DIVISOR for
-'' 0.0..1.0), or E_MODE if wantFunc is not active.
+' Read the top probability for wantFunc as a scaled integer 0..PROB_DIVISOR.
+'
+' @param wantFunc - required active function id
+' @returns probOrErr - scaled probability 0..PROB_DIVISOR (divide by PROB_DIVISOR for 0.0..1.0), or E_MODE if wantFunc is not active
 
   probOrErr := E_MODE
   if modeActive == wantFunc
@@ -952,10 +1128,15 @@ pri topProbIn(wantFunc) : probOrErr
 
 
 pri probOfIdIn(wantFunc, id, summSize) : probOrErr | offset
+' Read the probability of a specific id (1-based) from the per-id table.
+'
+' @param wantFunc - required active function id
+' @param id - 1-based per-id table index
+' @param summSize - latched summary size bounding the table (classification 128, feature 64)
+' @returns probOrErr - scaled probability 0..PROB_DIVISOR; E_MODE if wantFunc is not active; E_ARG if id < 1 or its table entry would fall outside the latched summary
 
-'' Probability of a specific id (1-based) from the per-id table, as a scaled integer
-'' 0..PROB_DIVISOR. E_MODE if wantFunc is not active; E_ARG if id < 1 or its table entry would
-'' fall outside the latched summary (summSize bounds it: classification 128, feature 64).
+' Local Variables:
+' @local offset - byte offset of the id's per-id table entry
 
   probOrErr := E_MODE
   if modeActive == wantFunc
@@ -967,8 +1148,10 @@ pri probOfIdIn(wantFunc, id, summSize) : probOrErr | offset
 
 
 pri payloadLength(wantFunc) : lenOrErr
-
-'' QR/barcode payload length (uint16 LE at QR_LEN_OFFS) from the latched summary, or E_MODE.
+' Read the QR/barcode payload length (uint16 LE at QR_LEN_OFFS) from the latched summary.
+'
+' @param wantFunc - required active function id
+' @returns lenOrErr - the payload byte length, or E_MODE if wantFunc is not active
 
   lenOrErr := E_MODE
   if modeActive == wantFunc
@@ -976,10 +1159,18 @@ pri payloadLength(wantFunc) : lenOrErr
 
 
 pri readPayload(wantFunc, base, pBuf) : status | len
-
-'' Read a QR/barcode payload into pBuf: length from the latched summary, then that many bytes
-'' (clamped to QR_DATA_MAX) from base + QR_DATA_OFFS. Returns the byte count read (0 for an empty
-'' payload), E_MODE if wantFunc is not active, or E_NAK on bus failure.
+' Read a QR/barcode payload into pBuf.
+'
+' @param wantFunc - required active function id
+' @param base - result-region base address
+' @param pBuf - destination buffer pointer
+' @returns status - the byte count read (0 for an empty payload), E_MODE if wantFunc is not active, or E_NAK on bus failure
+'
+' Length comes from the latched summary, then that many bytes (clamped to QR_DATA_MAX) are read
+' from base + QR_DATA_OFFS.
+'
+' Local Variables:
+' @local len - payload byte length, clamped to QR_DATA_MAX
 
   status := guardMode(wantFunc)
   if status == E_OK
@@ -989,7 +1180,7 @@ pri readPayload(wantFunc, base, pBuf) : status | len
       status := readFromAddr(base + QR_DATA_OFFS, pBuf, len)   ' spans 32-byte chunks via CHUNK_AUTOINC
 
 
-con { license }
+con ' ---- License ----
 
 {{
  -------------------------------------------------------------------------------------------------

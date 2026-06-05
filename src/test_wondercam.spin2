@@ -1,4 +1,4 @@
-{Spin2_v50}
+{Spin2_v45}
 '' =================================================================================================
 ''
 ''   File....... test_wondercam.spin2
@@ -22,21 +22,22 @@
 ''
 '' =================================================================================================
 
-con { clock and DEBUG serial }
+con ' ---- Clock and DEBUG Serial ----
 
   _clkfreq   = 320_000_000                                       ' canonical P2 clock (skill-conventions P2_CLOCK_FREQ)
   DEBUG_BAUD = 2_000_000                                         ' runtime DEBUG baud; pnut-term-ts must match with -b 2000000
 
 
-con { bench I2C wiring - SET THESE to match your board at hardware turn-on }
+con ' ---- Bench I2C Wiring ----
 
   PIN_SCL = 16                                                   ' I2C SCL pin (placeholder; confirm at bring-up L0)
   PIN_SDA = 17                                                   ' I2C SDA pin (placeholder; confirm at bring-up L0)
   BUS_KHZ = 400                                                  ' 100 / 400 / 1000 (WonderCam supports full speed)
 
 
-con { harness sizing - test buffers as named constants (authoring guide 6.4) }
+con ' ---- Harness Sizing ----
 
+  ' Test buffers as named constants (authoring guide 6.4).
   ' L3 reads a region LARGER than one I2C chunk so the read crosses a 32-byte boundary and exercises
   ' the driver's CHUNK_AUTOINC path. The probe length must exceed cam.READ_CHUNK to cross a boundary;
   ' it is read two ways (one big read vs two chunk-sized reads) and the two must agree byte-for-byte.
@@ -44,13 +45,13 @@ con { harness sizing - test buffers as named constants (authoring guide 6.4) }
   L3_PROBE_ADDR = cam.REG_FW_VERSION                             ' $0000: the 16-byte version then the system-register area (static between back-to-back reads)
 
 
-obj
+obj ' ---- Objects ----
 
   cam : "isp_wondercam"                                          ' the driver under test (alias 'cam'; 'wc' is reserved in pnut-ts)
   i2c : "isp_i2c_singleton"                                      ' referenced ONLY for the PU_* pull-up constant (no methods called here)
 
 
-var { harness tally + scratch buffers }
+var ' ---- Harness Tally and Scratch Buffers ----
 
   long  testsPassed                                             ' checks that matched expectation
   long  testsFailed                                             ' checks that did NOT match (expected-vs-actual printed)
@@ -64,9 +65,14 @@ var { harness tally + scratch buffers }
 
 pub main() | startStatus
 
-'' Regression entry point. Single straight-line flow (single exit, authoring guide 5.5): open the bus,
-'' run the automatable L0-L4 self-checks if the camera answers, then ALWAYS name the coverage gaps and
-'' print the tally - so a device-absent run still reports honestly instead of silently doing nothing.
+'' Regression entry point: open the bus, run the automatable L0-L4 self-checks if the camera answers,
+'' then ALWAYS name the coverage gaps and print the tally - so a device-absent run still reports
+'' honestly instead of silently doing nothing.
+''
+'' Single straight-line flow (single exit, authoring guide 5.2).
+
+' Local Variables:
+' @local startStatus - cam.start() result; gates the L0-L4 self-checks vs the device-absent path
 
   setup()
 
@@ -92,7 +98,8 @@ pub main() | startStatus
 
 pri setup()
 
-'' Banner. The tally longs (testsPassed/Failed/Skipped/Gaps) auto-zero at load, so no explicit reset.
+' Print the banner. The tally longs (testsPassed/Failed/Skipped/Gaps) auto-zero at load, so no reset.
+'
 
   debug("==================================================")
   debug("WonderCam driver regression - automatable L0-L4 subset")
@@ -101,13 +108,17 @@ pri setup()
   debug("==================================================")
 
 
-con { L1 - firmware version (register read + 16-bit framing + address byte order) }
+' ---- L1: Firmware Version (Register Read + 16-bit Framing + Address Byte Order) ----
 
-pub checkVersion() | nRead
+pri checkVersion() | nRead
 
-'' L1: read the 16 ASCII version bytes at REG_FW_VERSION. A correct length AND all-printable bytes
-'' prove the 16-bit register framing and the address byte order (ADDR_LOW_FIRST) are right - garbage
-'' here is the classic byte-order-reversed symptom. Retires the L1 row of the bring-up table.
+' L1: read the 16 ASCII version bytes at REG_FW_VERSION. A correct length AND all-printable bytes
+' prove the 16-bit register framing and the address byte order (ADDR_LOW_FIRST) are right - garbage
+' here is the classic byte-order-reversed symptom. Retires the L1 row of the bring-up table.
+'
+
+' Local Variables:
+' @local nRead - byte count returned by cam.firmwareVersion()
 
   nRead := cam.firmwareVersion(@verBuf)
   evalValue(nRead, @"L1: firmwareVersion() byte count", cam.FW_VERSION_LEN)
@@ -115,13 +126,17 @@ pub checkVersion() | nRead
   debug("  L1 version string = '", zstr_(@verBuf), "'")
 
 
-con { L2 / L4 - mode write + echo round-trip for all 11 applications }
+' ---- L2/L4: Mode Write + Echo Round-Trip for All 11 Applications ----
 
-pub checkModeEchoes() | funcId
+pri checkModeEchoes() | funcId
 
-'' L2/L4: write each of the 11 function ids and confirm the device echoes it back (setMode polls the
-'' echo internally, bounded). Also confirms the write path and that an out-of-range id is rejected.
-'' The LED WRITE returns a byte count here; its VISUAL effect is a named manual gap (reportGaps).
+' L2/L4: write each of the 11 function ids and confirm the device echoes it back (setMode polls the
+' echo internally, bounded). Also confirms the write path and that an out-of-range id is rejected.
+' The LED WRITE returns a byte count here; its VISUAL effect is a named manual gap (reportGaps).
+'
+
+' Local Variables:
+' @local funcId - function id being written and echo-checked across the FUNC_FIRST..FUNC_LAST scan
 
   debug("--- L2/L4: mode write + echo round-trip (funcs ", udec_(cam.FUNC_FIRST), "..", udec_(cam.FUNC_LAST), ") ---")
   funcId := cam.FUNC_FIRST
@@ -139,15 +154,21 @@ pub checkModeEchoes() | funcId
   evalValue(cam.setMode(cam.FUNC_LAST + 1), @"L2: setMode(out-of-range) rejected", cam.E_ARG)
 
 
-con { L3 - chunked read integrity (the chunk strategy gates every read > 32 bytes) }
+' ---- L3: Chunked Read Integrity (the Chunk Strategy Gates Every Read > 32 Bytes) ----
 
-pub checkLargeRead() | nBig, nLo, nHi
+pri checkLargeRead() | nBig, nLo, nHi
 
-'' L3: read a PROBE_LEN-byte region (> one chunk) two ways and require they AGREE byte-for-byte:
-''   A) one big read   - exercises the driver's CHUNK_AUTOINC walk across the 32-byte boundary
-''   B) two chunk-sized reads, each separately addressed - the reference the big read must reproduce
-'' If they disagree, chunk auto-increment is wrong and EVERY read over 32 bytes is corrupt. Also checks
-'' the known 16-byte version sub-pattern survives at the front of the big read. Retires the L3 row.
+' L3: read a PROBE_LEN-byte region (> one chunk) two ways and require they AGREE byte-for-byte:
+'   A) one big read   - exercises the driver's CHUNK_AUTOINC walk across the 32-byte boundary
+'   B) two chunk-sized reads, each separately addressed - the reference the big read must reproduce
+' If they disagree, chunk auto-increment is wrong and EVERY read over 32 bytes is corrupt. Also checks
+' the known 16-byte version sub-pattern survives at the front of the big read. Retires the L3 row.
+'
+
+' Local Variables:
+' @local nBig - byte count from the single big read
+' @local nLo - byte count from the low chunk-sized read
+' @local nHi - byte count from the high chunk-sized read
 
   if PROBE_LEN <= cam.READ_CHUNK
     skipCheck(@"L3: probe <= READ_CHUNK, cannot cross a chunk boundary - widen PROBE_LEN")
@@ -163,14 +184,19 @@ pub checkLargeRead() | nBig, nLo, nHi
     evalBool(buffersEqual(@probeA, @verBuf, cam.FW_VERSION_LEN), @"L3: big read front 16B == known version", TRUE)
 
 
-con { L4 - per-mode summary latch + shape + wrong-mode guard }
+' ---- L4: Per-Mode Summary Latch + Shape + Wrong-Mode Guard ----
 
-pub checkSummaryShapes() | funcId, nSumm
+pri checkSummaryShapes() | funcId, nSumm
 
-'' L4: for each mode, setMode then updateResult and confirm the summary latched at the EXPECTED size
-'' for that mode (classification 128, feature 64, else 48), and that the mode's primary accessor returns
-'' a non-error in-bounds value (counts/top-id, not E_MODE). Then confirm the wrong-mode guard fires.
-'' This validates the latch + guard logic WITHOUT physical targets; actual values are an L5 manual gap.
+' L4: for each mode, setMode then updateResult and confirm the summary latched at the EXPECTED size
+' for that mode (classification 128, feature 64, else 48), and that the mode's primary accessor returns
+' a non-error in-bounds value (counts/top-id, not E_MODE). Then confirm the wrong-mode guard fires.
+' This validates the latch + guard logic WITHOUT physical targets; actual values are an L5 manual gap.
+'
+
+' Local Variables:
+' @local funcId - function id being shape-checked across the FUNC_FIRST..FUNC_LAST scan
+' @local nSumm - summary size latched by updateResult() for the current mode
 
   debug("--- L4: per-mode summary-shape sanity ---")
   funcId := cam.FUNC_FIRST
@@ -189,12 +215,13 @@ pub checkSummaryShapes() | funcId, nSumm
   evalBool(cam.anyObject(),   @"L4: anyObject() in face mode -> FALSE", FALSE)
 
 
-con { device-absent path - name every automatable check we could not run }
+' ---- Device-Absent Path: Name Every Automatable Check We Could Not Run ----
 
 pri skipDeviceChecks()
 
-'' Reached when start() did not get an ACK. The L0-L4 self-checks are automatable but their precondition
-'' (a responding camera) is absent, so they are SKIPPED-and-named rather than silently omitted.
+' Reached when start() did not get an ACK. The L0-L4 self-checks are automatable but their precondition
+' (a responding camera) is absent, so they are SKIPPED-and-named rather than silently omitted.
+'
 
   debug("--- device did not ACK at 0x32: automatable checks SKIPPED (precondition absent) ---")
   skipCheck(@"L1: firmware-version sanity (no device)")
@@ -203,12 +230,13 @@ pri skipDeviceChecks()
   skipCheck(@"L4: per-mode summary-shape sanity (no device)")
 
 
-con { coverage roll-call - what this regression top CANNOT exercise (no silent gaps) }
+' ---- Coverage Roll-Call: What This Regression Top CANNOT Exercise (No Silent Gaps) ----
 
 pri reportGaps()
 
-'' Spec 7.2: the regression top names everything it could not exercise. These are not failures - they
-'' are the boundary between the automatable subset (above) and the manual host work (bring-up + L5).
+' Spec 7.2: the regression top names everything it could not exercise. These are not failures - they
+' are the boundary between the automatable subset (above) and the manual host work (bring-up + L5).
+'
 
   debug("--- COVERAGE GAPS: not automatable in this top (named, not failures) ---")
   gap(@"L2: LED fill-light VISUAL confirmation - eyeballed at the bench (host)")
@@ -220,11 +248,12 @@ pri reportGaps()
   gap(@"L3: CHUNK_AUTOINC=FALSE re-address fallback - only the compiled-in path is exercised; flip + re-run to cover")
 
 
-con { tally }
+' ---- Tally ----
 
 pri showCounts()
 
-'' Final scoreboard. A green run is pass>0 and fail==0; skip/gaps are expected and named above.
+' Print the final scoreboard. A green run is pass>0 and fail==0; skip/gaps are expected and named above.
+'
 
   debug("==================================================")
   debug("RESULTS  pass=", udec_(testsPassed), "  fail=", udec_(testsFailed), "  skip=", udec_(testsSkipped), "  gaps-named=", udec_(testsGaps))
@@ -235,16 +264,21 @@ pri showCounts()
   debug("==================================================")
 
 
-con { assertion helpers - self-contained (this greenfield repo has no shared test-utils object yet) }
+' ---- Assertion Helpers ----
 
-  ' Semantics mirror the authoring-guide 6.3 evaluate* family: a status/value check prints expected and
-  ' actual on failure; a boolean check tests against TRUE/FALSE; ranges and non-negativity have intent-
-  ' naming variants. Labels are passed as @"..." pointers and read like statements of intent.
+' Self-contained (this greenfield repo has no shared test-utils object yet).
+' Semantics mirror the authoring-guide 6.3 evaluate* family: a status/value check prints expected and
+' actual on failure; a boolean check tests against TRUE/FALSE; ranges and non-negativity have intent-
+' naming variants. Labels are passed as @"..." pointers and read like statements of intent.
 
 pri evalValue(actual, pLabel, expected)
 
-'' Pass when actual == expected; on failure print BOTH values so a regression is diagnosable from the
-'' log alone (not just "fail"). Use for status codes and exact numeric values.
+' Pass when actual == expected; on failure print BOTH values so a regression is diagnosable from the
+' log alone (not just "fail"). Use for status codes and exact numeric values.
+'
+' @param actual - the value produced by the code under test
+' @param pLabel - pointer to the zstring intent label printed with the result
+' @param expected - the value actual must equal to pass
 
   if actual == expected
     testsPassed++
@@ -256,8 +290,12 @@ pri evalValue(actual, pLabel, expected)
 
 pri evalBool(bActual, pLabel, bExpected)
 
-'' Pass when both operands have the same truthiness. Use only for values that are already boolean
-'' (any*/*Detected predicates), never for status codes (authoring guide 6.3).
+' Pass when both operands have the same truthiness. Use only for values that are already boolean
+' (any*/*Detected predicates), never for status codes (authoring guide 6.3).
+'
+' @param bActual - the boolean value produced by the code under test
+' @param pLabel - pointer to the zstring intent label printed with the result
+' @param bExpected - the boolean value bActual must match in truthiness to pass
 
   if (bActual <> FALSE) == (bExpected <> FALSE)
     testsPassed++
@@ -269,8 +307,11 @@ pri evalBool(bActual, pLabel, bExpected)
 
 pri evalNonNeg(actual, pLabel)
 
-'' Pass when actual is a non-negative success value (>= E_OK); a negative driver error code fails.
-'' Use where the exact value depends on what is in frame but a SUCCESS/ERROR distinction is automatable.
+' Pass when actual is a non-negative success value (>= E_OK); a negative driver error code fails.
+' Use where the exact value depends on what is in frame but a SUCCESS/ERROR distinction is automatable.
+'
+' @param actual - the value produced by the code under test
+' @param pLabel - pointer to the zstring intent label printed with the result
 
   if actual >= cam.E_OK
     testsPassed++
@@ -282,7 +323,9 @@ pri evalNonNeg(actual, pLabel)
 
 pri skipCheck(pLabel)
 
-'' An automatable check whose precondition is absent this run (e.g. no device). Named, never silent.
+' Count and name an automatable check whose precondition is absent this run (e.g. no device).
+'
+' @param pLabel - pointer to the zstring intent label naming the skipped check
 
   testsSkipped++
   debug("  SKIP  ", zstr_(pLabel))
@@ -290,19 +333,29 @@ pri skipCheck(pLabel)
 
 pri gap(pLabel)
 
-'' A check that is inherently not automatable in this top (manual / host / needs physical targets).
-'' Named so coverage boundaries are explicit; counted separately from pass/fail/skip.
+' Count and name a check that is inherently not automatable in this top (manual / host / needs targets).
+' Named so coverage boundaries are explicit; counted separately from pass/fail/skip.
+'
+' @param pLabel - pointer to the zstring intent label naming the coverage gap
 
   testsGaps++
   debug("  GAP   ", zstr_(pLabel))
 
 
-con { small pure helpers }
+' ---- Small Pure Helpers ----
 
 pri isPrintableAscii(pBuf, len) : bAllPrintable | idx, ch
 
-'' TRUE if every one of len bytes at pBuf is a printable ASCII char ($20..$7E). A reversed-byte-order
-'' or NAK'd version read shows up here as non-printable bytes.
+' Return TRUE if every one of len bytes at pBuf is a printable ASCII char ($20..$7E). A reversed
+' byte-order or NAK'd version read shows up here as non-printable bytes.
+'
+' @param pBuf - pointer to the byte buffer to scan
+' @param len - number of bytes to scan
+' @returns bAllPrintable - TRUE when all scanned bytes are printable ASCII, else FALSE
+
+' Local Variables:
+' @local idx - scan index into the buffer
+' @local ch - the byte being range-checked
 
   bAllPrintable := TRUE
   idx := 0
@@ -316,7 +369,15 @@ pri isPrintableAscii(pBuf, len) : bAllPrintable | idx, ch
 
 pri buffersEqual(pLeft, pRight, len) : bEqual | idx
 
-'' TRUE if the first len bytes at pLeft and pRight are identical.
+' Return TRUE if the first len bytes at pLeft and pRight are identical.
+'
+' @param pLeft - pointer to the first byte buffer
+' @param pRight - pointer to the second byte buffer
+' @param len - number of bytes to compare
+' @returns bEqual - TRUE when all compared bytes match, else FALSE
+
+' Local Variables:
+' @local idx - scan index into both buffers
 
   bEqual := TRUE
   idx := 0
@@ -329,8 +390,11 @@ pri buffersEqual(pLeft, pRight, len) : bEqual | idx
 
 pri expectedSummSize(funcId) : nBytes
 
-'' The updateResult() summary size the driver reads for funcId (mirrors the driver's summaryReadPlan:
-'' classification 128, feature-learning 64, every other mode 48).
+' Return the updateResult() summary size the driver reads for funcId (mirrors the driver's
+' summaryReadPlan: classification 128, feature-learning 64, every other mode 48).
+'
+' @param funcId - the function id whose summary size is wanted
+' @returns nBytes - the expected summary size in bytes for funcId
 
   case funcId
     cam.FUNC_CLASSIFY : nBytes := cam.SUMM_SIZE_CLASS
@@ -340,9 +404,12 @@ pri expectedSummSize(funcId) : nBytes
 
 pri primaryResult(funcId) : valOrErr
 
-'' The natural "did this mode latch something readable" accessor for funcId: a detection count for the
-'' spatial modes, the argmax id for the classification-style modes, the payload length for QR/barcode.
-'' Returns a non-negative value when the mode is active and in-bounds, or a negative driver error code.
+' Call the natural "did this mode latch something readable" accessor for funcId: a detection count for
+' the spatial modes, the argmax id for the classification-style modes, the payload length for QR/barcode.
+' Returns a non-negative value when the mode is active and in-bounds, or a negative driver error code.
+'
+' @param funcId - the active function id whose primary accessor is invoked
+' @returns valOrErr - the accessor result (non-negative) or a negative driver error code
 
   case funcId
     cam.FUNC_FACE     : valOrErr := cam.numFaces()
@@ -361,7 +428,10 @@ pri primaryResult(funcId) : valOrErr
 
 pri modeName(funcId) : pName
 
-'' Human-readable label for a function id, for the per-mode log headers.
+' Return a pointer to a human-readable label for a function id, for the per-mode log headers.
+'
+' @param funcId - the function id to label
+' @returns pName - pointer to the zstring label for funcId
 
   case funcId
     cam.FUNC_FACE     : pName := @"face"
@@ -378,7 +448,7 @@ pri modeName(funcId) : pName
     other             : pName := @"?"
 
 
-con { license }
+con ' ---- License ----
 
 {{
  -------------------------------------------------------------------------------------------------
