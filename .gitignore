@@ -231,3 +231,16 @@ REF-NO-COMMIT/
 !.claude/skills/
 .claude/skills/*/*
 !.claude/skills/*/project-overlay.md
+
+# todo-mcp local task ledger / archives (process bookkeeping; curated record lives in DOCs/plans/archive/)
+tasks/
+
+# P2 / pnut-ts build artifacts
+*.bin
+*.binary
+*.lst
+*.map
+*.flash
+*.obj
+*__pre.spin2
+.pnut-cache/

@@ -1,6 +1,6 @@
 # WonderCam P2 Spin2 Driver - Requirements and Specification
 
-Status: DRAFT (v0.1) - 2026-06-04
+Status: IMPLEMENTED (v0.1.0) - as-built 2026-06-05; supersedes DRAFT v0.1 (2026-06-04)
 Owner: Stephen (stephen@ironsheep.biz)
 Supersedes: nothing (initial requirements)
 
@@ -10,6 +10,19 @@ It defines WHAT the driver must do and the shape of its public API; it does not
 contain Spin2 implementation. Hex addresses, struct layouts, and the per-mode
 result map are owned by the theory of operation and referenced here rather than
 duplicated.
+
+**As-built (2026-06-05).** The v0.1.0 driver, demo, and regression top are
+implemented and compile clean under pnut-ts in the container; on-hardware bring-up
+(the Section 7 L0-L5 work) is the host-only turn-on that follows. Two decisions
+locked during implementation refine the requirements below and are noted inline:
+- **Provided I2C object dependency.** The driver does not embed its own
+  bit-banged I2C. It composes a provided singleton I2C object
+  (`src/isp_i2c_singleton.spin2`) that it OWNS and configures as a dedicated bus.
+  This satisfies FR-5's bus model minus the optional lock (see 3.3 / FR-5).
+- **flexspin compat deferred.** The secondary portability compile under flexspin
+  (NFR-3 / Section 11) is DEFERRED to a post-certification pass; v0.1.0 acceptance
+  rests on pnut-ts compile-clean plus the host bring-up. flexspin is host-only and
+  is not a v0.1.0 gate.
 
 ---
 
@@ -102,6 +115,14 @@ The driver MUST be usable on a bus shared with other I2C devices:
   the same bus do not interleave transfers.
 - The driver assumes nothing about pull-ups or exclusive ownership of the pins.
 
+**As-built (v0.1.0):** the driver composes a provided singleton I2C object
+(`src/isp_i2c_singleton.spin2`) that it OWNS and configures as a DEDICATED bus,
+and v0.1.0 ships WITHOUT the optional lock - `start` configures its own bus and
+no `lockId` is taken. The shared-bus lock is deferred (decision 2026-06-05,
+tracked in `DOCs/plans/PUNCH-LIST.md`); the own-instance object already satisfies
+the bus-model half of this requirement, leaving only the lock to add when a
+deployment actually shares the bus.
+
 ### 3.4 Spin2 / pnut-ts version posture
 
 The driver targets pnut-ts (see `.claude/skill-conventions.md`). Typed pointers
@@ -157,6 +178,12 @@ the authoring guide. The demo requires `{Spin2_v50}` for DEBUG PLOT layer/crop.
 
 Natural, standard-looking; final signatures settle during implementation. Names
 avoid the authoring guide's known collisions.
+
+> **As-built note (v0.1.0).** This section is the PROPOSED shape; the binding
+> as-built API contract lives in `DOCs/WonderCam-Driver-Theory-of-Operation.md`.
+> One signature settled differently: `start` takes a bus-pullup flag rather than a
+> `lockId` (the driver owns a dedicated bus and the shared-bus lock is deferred -
+> see 3.3), i.e. `start(sclPin, sdaPin, busKHz, pullup)`.
 
 **Lifecycle / system**
 ```
@@ -293,9 +320,11 @@ flexspin compat compile (portability check) is host-only.
 - **NFR-2 Dual-environment discipline.** Compile in the container; flash/run and
   flexspin compat on the macOS host. The driver must not assume a runtime tool
   that the container lacks.
-- **NFR-3 Reuse / portability.** The driver object is self-contained and
-  dependency-light so it drops into the robot's sensor mix. It compiles clean
-  under both pnut-ts and (host) flexspin.
+- **NFR-3 Reuse / portability.** The driver object is dependency-light (it
+  composes only the provided `isp_i2c_singleton` object) so it drops into the
+  robot's sensor mix. It compiles clean under pnut-ts; the flexspin
+  compat-compile is DEFERRED to a post-certification pass (host-only) and is not
+  a v0.1.0 gate.
 - **NFR-4 Documentation parity.** Public methods carry doc-comments per the
   authoring guide; result-record `STRUCT`s are documented with field units.
 
@@ -334,7 +363,8 @@ trusted.
 
 ## 11. Acceptance (v1)
 
-- Driver compiles clean under pnut-ts (container) and flexspin (host).
+- Driver compiles clean under pnut-ts (container). flexspin compat-compile is
+  deferred to a post-certification pass (host-only) - not a v0.1.0 gate.
 - Full register access demonstrated (read version, toggle LED, switch modes, read
   each region) via the regression top.
 - High-level API present for all 11 applications; the five vendor bugs corrected.

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Parallax Propeller 2 (P2) Spin2 driver for the **Hiwonder WonderCam AI Vision Camera**, an I2C smart camera that runs on-device vision models (face/object/color detection, line following, AprilTag, QR/barcode, image classification, feature learning).
 
-This is a **greenfield port**: `src/` is currently empty. The driver does not exist yet. The work is to author the Spin2 driver by porting the published WonderCam protocol from the vendor's reference SDKs.
+This began as a **greenfield port** of the published WonderCam protocol from the vendor's reference SDKs. As of v0.1.0 the driver, its front-panel demo, and a regression top exist in `src/` and compile clean under `pnut-ts`; what remains is the host-only hardware bring-up (see the status in `README.md` and the bring-up playbook in `DOCs/plans/`).
 
 ## Dual environment: compile here, flash on the host
 
@@ -29,7 +29,7 @@ pnut-ts -l -m src/demo_wondercam.spin2   # also emit .map memory map
 pnut-ts -d src/demo_wondercam.spin2      # compile with DEBUG enabled
 ```
 
-Planned source layout (Iron Sheep naming): driver object `src/isp_wondercam.spin2`, demo top `src/demo_wondercam.spin2`, regression top `src/test_wondercam.spin2`. The driver carries a `VERSION` CON. There is no host-side unit-test runner — "tests" in the Spin2 sense are P2 programs run on hardware (host-only; see Part 6 of the authoring guide); the in-repo `TEST_COMMAND` is a compile-clean check.
+Source layout (Iron Sheep naming): driver object `src/isp_wondercam.spin2` (composing the provided `src/isp_i2c_singleton.spin2`), demo top `src/demo_wondercam.spin2`, regression top `src/test_wondercam.spin2`. The driver carries a `VERSION` CON. There is no host-side unit-test runner — "tests" in the Spin2 sense are P2 programs run on hardware (host-only; see Part 6 of the authoring guide); the in-repo `TEST_COMMAND` is a compile-clean check.
 
 ## Mandatory: the Spin2 Authoring Guide
 

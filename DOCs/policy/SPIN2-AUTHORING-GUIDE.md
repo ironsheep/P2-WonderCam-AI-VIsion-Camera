@@ -71,6 +71,17 @@ Spin2 identifiers are case-insensitive. A local variable, return variable, or me
 | `bool` | Reserved in pnut-ts v1.52+ | `bExists`, `bValid`, `bAvail` |
 | `string` | Built-in `STRING()` | `pStr`, `pText`, `textBuf` |
 | `send` | Built-in `SEND` | `sendData`, `transmit` |
+| `wc` | PASM2 carry-write flag `WC` | `cam`, `pCam`, `device` |
+| `step` | `repeat ... step` keyword | `stepSize`, `incr`, `delta` |
+| `neg` | PASM2 instruction `NEG` | `negate`, `isNeg`, `bNeg` |
+| `skip` / `skipf` | PASM2 instructions `SKIP` / `SKIPF` | `skipCount`, `nSkip` |
+| `pa` / `pb` / `ptra` / `ptrb` / `dira` | P2 special registers | `portA`, `pinA`, `pBufA` |
+
+These were not theoretical: every row below `send` was a real collision that bit
+this project during driver/demo authoring (the `wc`/`step`/`neg` cluster while
+building the demo, the `skip`/`pa`-family cluster while building the regression
+top). Object aliases (`wc`), parameters (`step`), and PASM2/register mnemonics
+collide case-insensitively even though they read like ordinary names.
 
 **Also avoid** (not a collision, but a naming-quality rule): `result` as a return variable name — see Rule 2.3.
 

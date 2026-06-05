@@ -1,0 +1,1018 @@
+{Spin2_v50}
+'' =================================================================================================
+''
+''   File....... isp_wondercam.spin2
+''   Purpose.... P2 driver for the Hiwonder WonderCam AI vision camera (I2C)
+''   Author..... Stephen M Moraco
+''               Copyright (c) 2026 Iron Sheep Productions, LLC
+''               -- see below for terms of use
+''   E-mail..... stephen@ironsheep.biz
+''   Started.... 05 Jun 2026
+''   Updated.... 05 Jun 2026
+''
+'' =================================================================================================
+
+{{
+  Two-layer driver for the WonderCam (Kendryte K210 + OV2640) I2C smart camera.
+  This file currently carries the device register/memory map as named constants
+  (plan section 2). Transport, system control, and the per-application API land
+  in later tasks.
+
+  The map is transcribed from DOCs/research/WONDERCAM-THEORY-OF-OPERATION.md
+  section 4. Constants flagged "bring-up L#" are confirmed/corrected on real
+  hardware by the bring-up playbook (see the CON { tunable } block at the end).
+}}
+
+con { driver identity }
+
+  VERSION = 0_01_00                                            ' driver version 0.1.0 (MM_mm_pp; '_' are digit separators)
+
+
+con { driver result codes }
+
+  E_OK       = 0                                               ' success (read/write also return a byte count >= 0)
+  E_NAK      = -1                                              ' device did not acknowledge
+  E_ARG      = -2                                              ' invalid argument
+  E_MODE     = -3                                              ' operation not valid for the active function
+  E_NOTFOUND = -4                                              ' requested id/index not present in the latched results this frame
+
+
+con { I2C device addressing }
+
+  CAM_ADDR_7BIT = $32                                          ' WonderCam 7-bit slave address (code-confirmed; PDF omits - bring-up L0)
+  CAM_ADDR_WR   = CAM_ADDR_7BIT << 1                           ' = $64, address byte for write transactions
+  CAM_ADDR_RD   = CAM_ADDR_WR | 1                              ' = $65, address byte for read transactions
+
+
+con { system registers - the only writable registers on the device }
+
+  REG_FW_VERSION = $0000                                       ' R   16 ASCII bytes - firmware version string (e.g. "v0.6.5")
+  REG_LIGHT      = $0030                                       ' RW   1 byte        - fill light: 1 = on, 0 = off
+  REG_FUNC       = $0035                                       ' RW   1 byte        - active function: write to select, read to confirm
+
+  FW_VERSION_LEN = 16                                          ' REG_FW_VERSION payload width (ASCII, NOT null-terminated)
+  SYS_REG_LEN    = 1                                           ' REG_LIGHT / REG_FUNC are single-byte registers
+
+
+con { application function numbers - device APPLICATION enum order }
+
+  #0, FUNC_NONE, FUNC_FACE, FUNC_OBJECT, FUNC_CLASSIFY, FUNC_FEATURE, FUNC_COLOR, FUNC_LINE, FUNC_APRILTAG, FUNC_QRCODE, FUNC_BARCODE, FUNC_NUMBER, FUNC_LANDMARK
+
+  FUNC_FIRST = FUNC_FACE                                       ' func 1
+  FUNC_LAST  = FUNC_LANDMARK                                   ' func 11 (11 applications, 1..11)
+  ' FUNC_COLOR (5), FUNC_NUMBER (10), FUNC_LANDMARK (11) are code-derived; confirm vs firmware at bring-up L4/L5.
+
+
+con { per-application result-region base addresses }
+
+  BASE_FACE     = $0400
+  BASE_OBJECT   = $0800
+  BASE_CLASSIFY = $0C00
+  BASE_NUMBER   = $0D00                                        ' Python-only source - bring-up L5
+  BASE_LANDMARK = $0D80                                        ' Python-only source - bring-up L5
+  BASE_FEATURE  = $0E00
+  BASE_COLOR    = $1000
+  BASE_LINE     = $1400
+  BASE_QRCODE   = $1800
+  BASE_BARCODE  = $1C00
+  BASE_APRILTAG = $1E00
+
+
+con { result-region layout - summary at BASE, detail/payload at BASE + DETAIL_OFFS }
+
+  DETAIL_OFFS       = $30                                      ' = 48; detail base = BASE + DETAIL_OFFS
+  SUMM_SIZE_STD     = 48                                       ' updateResult summary read size: most modes
+  SUMM_SIZE_FEATURE = 64                                       ' feature-learning summary read size
+  SUMM_SIZE_CLASS   = 128                                      ' classification summary read size
+  STRIDE_BOX        = 16                                       ' face/object/color/line detail-record stride
+  TAG_REC_SIZE      = 32                                       ' AprilTag detail-record size (bytes to read per tag)
+  PERID_TABLE_OFFS  = $10                                      ' classification/feature/number/landmark per-id table at BASE + 0x10
+  PERID_STRIDE      = 4                                        ' bytes per id (uint16 prob + 2 reserved)
+  PROB_DIVISOR      = 10000                                    ' raw prob / PROB_DIVISOR -> 0.0 .. 1.0
+
+
+con { summary-header byte offsets - DETECTION shape (face/object/color/line/tag) }
+
+  SUMM_FUNC_ECHO      = 0                                      ' byte[0] = function-echo / refresh marker
+  SUMM_COUNT          = 1                                      ' byte[1] = primary detection count
+  SUMM_FACE_LEARNED   = 2                                      ' byte[2] = learned-face count   (FACE only)
+  SUMM_FACE_UNLEARNED = 3                                      ' byte[3] = unlearned-face count (FACE only)
+  IDLIST_OFFS_FACE    = 4                                      ' FACE id list starts at byte[4]
+  IDLIST_OFFS_OTHER   = 2                                      ' OBJ/COLOR/LINE/TAG id list starts at byte[2]
+  IDLIST_CAP          = 29                                     ' id-list capacity scanned for FACE/OBJECT (vendor loops i..i+29)
+  FACE_ID_UNLEARNED   = $FF                                    ' id-list sentinel marking an unlearned (no-id) face
+
+
+con { summary-header byte offsets - CLASSIFICATION shape (classify/feature/number/landmark) }
+
+  SUMM_CLASS_TOPID = 1                                         ' byte[1] = argmax id (NOT a count)
+  SUMM_CLASS_PROB  = 2                                         ' uint16 LE at bytes[2..3] = max prob (/ PROB_DIVISOR)
+
+
+con { QR / barcode payload layout }
+
+  QR_LEN_OFFS  = $20                                           ' uint16 LE payload length at BASE + 0x20
+  QR_DATA_OFFS = $30                                           ' payload at BASE + 0x30
+  QR_DATA_MAX  = 400                                           ' max payload bytes
+
+
+con { detail-record field offsets - box record (face/object/color), 16 B (8 used) }
+
+  REC_X = 0                                                    ' int16  x (origin or center, signed)
+  REC_Y = 2                                                    ' int16  y (signed)
+  REC_W = 4                                                    ' uint16 width
+  REC_H = 6                                                    ' uint16 height
+
+
+con { detail-record field offsets - line record, 16 B (12 used) }
+
+  LINE_START_X = 0                                             ' int16
+  LINE_START_Y = 2                                             ' int16
+  LINE_END_X   = 4                                             ' int16
+  LINE_END_Y   = 6                                             ' int16
+  LINE_ANGLE   = 8                                             ' int16  deflection / theta (raw)
+  LINE_OFFSET  = 10                                            ' int16  offset (raw)
+
+  ' getLine() normalization (mirrors vendor lineId() post-processing) - interpretation, bring-up L4
+  LINE_ANGLE_WRAP    = 90                                      ' angle above this wraps by one period into -90..+90
+  LINE_ANGLE_PERIOD  = 180                                     ' angle wrap period (degrees)
+  LINE_OFFSET_CENTER = 160                                     ' frame-center column (half of the 320 px frame width)
+
+
+con { detail-record field offsets - AprilTag record, 32 B }
+
+  TAG_X  = 0                                                   ' int16  center x
+  TAG_Y  = 2                                                   ' int16  center y
+  TAG_W  = 4                                                   ' uint16 width
+  TAG_H  = 6                                                   ' uint16 height
+  TAG_XT = 8                                                   ' float  X translation
+  TAG_XR = 12                                                  ' float  X rotation
+  TAG_YT = 16                                                  ' float  Y translation
+  TAG_YR = 20                                                  ' float  Y rotation
+  TAG_ZT = 24                                                  ' float  Z translation
+  TAG_ZR = 28                                                  ' float  Z rotation
+
+
+con { shared result-record STRUCT types - the decoded form filled by the per-application API }
+
+  ' One definition each, shared by the spatial/classification API (later tasks), the demo views,
+  ' and the regression top - never re-declared per consumer. Defined in a CON block, so they are
+  ' auto-exported to parent objects (Spin2 v49+); a parent imports them as e.g. "wc.spatial_result_t".
+  ' Requires the {Spin2_v50} directive at the top of this file (STRUCT needs v45+).
+  '
+  ' Field widths and order mirror the device record byte layouts exactly (theory-of-operation
+  ' section 4.4), so the API can bulk-read a record straight into the struct: the P2 is
+  ' little-endian and the device sends each multi-byte field little-endian, so byte N of the
+  ' record lands on byte N of the struct.
+  '
+  ' Spin2 STRUCTs have no signed-16 or float member type, so:
+  ' -- signed int16 fields (x, y, line endpoints, angle, offset) are stored as WORD (unsigned 0..65535);
+  '    the accessor sign-extends them (value SIGNX 15) when returning a value - NOT done here.
+  ' -- float fields are stored as LONG holding the raw IEEE-754 bit pattern; treat as FLOAT at use.
+
+  STRUCT spatial_result_t(WORD x, WORD y, WORD w, WORD h)     ' face / object / color: 8 B, mirrors box record (REC_X/Y/W/H)
+
+  STRUCT line_result_t(WORD start_x, WORD start_y, WORD end_x, WORD end_y, WORD angle, WORD offset)  ' line: 12 B (LINE_* offsets)
+
+  STRUCT tag_result_t(WORD x, WORD y, WORD w, WORD h, LONG x_t, LONG x_r, LONG y_t, LONG y_r, LONG z_t, LONG z_r)  ' AprilTag: 32 B, 6 float pose LONGs (TAG_* offsets)
+
+
+con { FR-7 tunable - hardware-UNVERIFIED defaults, corrected in ONE place after bring-up }
+
+  ' Each default is the code-authoritative reading from the theory of operation; the bring-up
+  ' playbook confirms or corrects each on real hardware before the high-level API is trusted.
+
+  ADDR_LOW_FIRST = TRUE                                        ' 16-bit reg address byte order: TRUE = low byte first (code) - bring-up L1
+  READ_CHUNK     = 32                                          ' bytes per I2C read transaction (vendor uses 32) - bring-up L3
+  CHUNK_AUTOINC  = TRUE                                        ' device auto-increments read pointer across chunks? - bring-up L3 (gates reads > READ_CHUNK)
+  TAG_REC_STRIDE = 32                                          ' AprilTag per-record advance: 32 (PDF), NOT vendor 0x32=50 typo - bring-up L5
+
+
+con { setMode() echo-poll bound - mirrors vendor changeFunc() (WonderCam.cpp:56-72) }
+
+  ' The on-device model can take seconds to swap; setMode() writes REG_FUNC then polls until the
+  ' read-back echo matches, bounded so a non-responsive device returns an error instead of hanging.
+  MODE_SETTLE_MS = 50                                          ' settle after writing REG_FUNC, before first poll (vendor delay(50))
+  MODE_POLL_MS   = 50                                          ' delay between echo polls (vendor delay(50))
+  MODE_POLL_MAX  = 80                                          ' max polls before giving up (~ 50 + 80*50 = 4050 ms worst case)
+
+
+obj
+
+  i2c : "isp_i2c_singleton"                                    ' low-level I2C; driver owns/configures this dedicated bus (see start()) - bus locking deferred (PUNCH-LIST)
+
+
+var { per-instance driver state }
+
+  byte  modeActive                                            ' last function id read from the device (cached by currentMode/updateResult)
+  byte  summBuffer[SUMM_SIZE_CLASS]                           ' active-mode summary, refreshed by updateResult(); read by the per-application API
+
+
+pub null()
+
+'' This is not a top-level object
+
+
+pub start(sclPin, sdaPin, busKHz, pullup) : status
+
+'' Configure the dedicated I2C bus this driver owns and probe for the camera.
+'' -- busKHz   : 100 (standard), 400 (full), 1000 (fast)
+'' -- pullup   : i2c.PU_NONE / PU_1K5 / PU_3K3 / PU_15K (high-drive selection)
+'' -- returns E_OK if the camera acknowledges its address, E_NAK if absent
+''    (allow the camera's power-on boot to finish before calling start)
+'' NOTE: this driver owns this bus exclusively - no bus lock in v0.1.0 (shared-bus locking deferred, see PUNCH-LIST)
+
+  i2c.setup(sclPin, sdaPin, busKHz, pullup)
+  modeActive := FUNC_NONE                                     ' nothing read yet
+  status := E_NAK
+  if i2c.present(CAM_ADDR_WR) == i2c.ACK                      ' present() leaves the bus mid-transaction...
+    status := E_OK
+  i2c.stop()                                                  ' ...so release it with a STOP either way
+
+
+pub stop() : status
+
+'' Release the I2C bus. The driver holds no cog or other resources, so this only
+'' forms a STOP condition to leave the lines in their idle-high state.
+
+  i2c.stop()
+  status := E_OK
+
+
+pub firmwareVersion(pStr) : status
+
+'' Read the FW_VERSION_LEN-byte ASCII firmware-version string into pStr.
+'' -- pStr must point at a buffer of at least FW_VERSION_LEN bytes (NOT null-terminated by the device)
+'' -- returns the byte count (FW_VERSION_LEN) on success, or E_NAK
+
+  status := readFromAddr(REG_FW_VERSION, pStr, FW_VERSION_LEN)
+
+
+pub setLed(bEnable) : status | onOff
+
+'' Turn the camera's fill light on (bEnable nonzero) or off (bEnable zero).
+'' -- returns the byte count (SYS_REG_LEN) on success, or E_NAK
+
+  onOff := 0
+  if bEnable
+    onOff := 1
+  status := writeToAddr(REG_LIGHT, @onOff, SYS_REG_LEN)
+
+
+pub setMode(funcId) : status | polls
+
+'' Select the active vision application and confirm the device adopted it.
+'' Writes REG_FUNC then polls the read-back echo (the model swap can take seconds),
+'' bounded by MODE_POLL_MAX so an unresponsive device returns an error, never hangs.
+'' -- returns E_OK once the echo matches, E_ARG if funcId is out of range,
+''    E_NAK if the write was not acknowledged, E_MODE if the echo never matched in time
+'' Mirrors vendor changeFunc() (WonderCam.cpp:56-72). Keep this (slow) call separate
+'' from updateResult() (fast poll) per spec FR-2.
+
+  if funcId < FUNC_FIRST or funcId > FUNC_LAST
+    status := E_ARG
+  else
+    status := writeToAddr(REG_FUNC, @funcId, SYS_REG_LEN)
+    if status >= E_OK                                         ' write acknowledged (returns byte count)
+      status := E_MODE                                        ' assume the echo will not settle until proven otherwise
+      waitms(MODE_SETTLE_MS)
+      polls := 0
+      repeat
+        if currentMode() == funcId                           ' echo matched: mode adopted
+          status := E_OK
+          quit
+        polls++
+        if polls > MODE_POLL_MAX                              ' bound the wait (status stays E_MODE)
+          quit
+        waitms(MODE_POLL_MS)
+
+
+pub currentMode() : modeOrErr | regByte
+
+'' Read REG_FUNC to learn the device's active function and cache it.
+'' -- returns the function id (FUNC_NONE..FUNC_LAST) on success, or E_NAK
+
+  regByte := 0
+  if readFromAddr(REG_FUNC, @regByte, SYS_REG_LEN) >= E_OK
+    modeActive := regByte
+    modeOrErr  := regByte
+  else
+    modeOrErr  := E_NAK
+
+
+pub updateResult() : status | base, summSize
+
+'' Refresh the cached summary for the device's active mode (the fast poll path, spec FR-2).
+'' Reads REG_FUNC, then reads that mode's summary region into summBuffer at the mode's summary
+'' size. The per-application API (later tasks) decodes counts/ids from summBuffer.
+'' -- returns the summary byte count (>= 0) on success, E_NAK on bus failure, E_MODE if no mode is active (FUNC_NONE)
+
+  status := currentMode()                                     ' refreshes modeActive; returns mode id or E_NAK
+  if status >= E_OK
+    base, summSize := summaryReadPlan(status)
+    if base == 0                                              ' FUNC_NONE or an unmapped mode: no result region
+      status := E_MODE
+    else
+      status := readFromAddr(base, @summBuffer, summSize)
+
+
+pub readReg(regAddr, pBuf, byteCount) : status
+
+'' Raw read: byteCount bytes from any 16-bit register regAddr into pBuf (spec FR-1).
+'' A thin passthrough over the transport so every device register stays reachable
+'' independent of the high-level wrappers.
+'' -- returns the byte count (>= 0) on success, or the transport error code unchanged (E_NAK)
+
+  status := readFromAddr(regAddr, pBuf, byteCount)             ' pass the transport result through verbatim (authoring guide 5.6)
+
+
+pub writeReg(regAddr, pBuf, byteCount) : status
+
+'' Raw write: byteCount bytes from pBuf to any 16-bit register regAddr (spec FR-1).
+'' A thin passthrough over the transport (see readReg).
+'' -- returns the byte count (>= 0) on success, or the transport error code unchanged (E_NAK)
+
+  status := writeToAddr(regAddr, pBuf, byteCount)             ' pass the transport result through verbatim (authoring guide 5.6)
+
+
+con { high-level spatial-detection API (face / object / color / line / AprilTag) - spec FR-3 }
+
+  ' All accessors read the summary latched by the most recent updateResult() (call it first).
+  ' Return model (spec FR-6): counts and get* return a non-negative success value or a NEGATIVE
+  ' error code (E_MODE wrong active mode, E_NAK bus failure, E_ARG bad argument, E_NOTFOUND id/index
+  ' absent this frame); boolean-by-nature predicates (any*, *Detected) return TRUE/FALSE, FALSE when
+  ' the mode is not active. Coordinate fields delivered into the caller's STRUCT are signed int16
+  ' stored as WORD; sign-extend with `value SIGNX 15` when reading into a 32-bit value.
+
+
+pub anyFaceDetected() : bFlag
+
+'' TRUE if the latched face summary reports one or more faces (FALSE if not in face mode).
+
+  bFlag := anyDetectedIn(FUNC_FACE)
+
+
+pub numFaces() : countOrErr
+
+'' Total detected faces, or E_MODE if face mode is not active.
+
+  countOrErr := numDetectedIn(FUNC_FACE)
+
+
+pub numLearned() : countOrErr
+
+'' Learned (id-bearing) faces, or E_MODE if face mode is not active.
+
+  countOrErr := E_MODE
+  if modeActive == FUNC_FACE
+    countOrErr := summBuffer[SUMM_FACE_LEARNED]
+
+
+pub numUnlearned() : countOrErr
+
+'' Unlearned (no-id) faces, or E_MODE if face mode is not active.
+
+  countOrErr := E_MODE
+  if modeActive == FUNC_FACE
+    ' FIX (vendor bug 1, WonderCam.cpp numOfTotalUnlearnedFaceDetected): the vendor returned
+    ' (int)result_summ - the buffer POINTER - instead of the count byte. Read the byte.
+    countOrErr := summBuffer[SUMM_FACE_UNLEARNED]
+
+
+pub faceIdDetected(id) : bFlag
+
+'' TRUE if a face with the given id is in the latched results (FALSE if not in face mode).
+
+  bFlag := FALSE
+  if modeActive == FUNC_FACE
+    bFlag := findIdSlot(IDLIST_OFFS_FACE, IDLIST_CAP, id, 0) >= 0
+
+
+pub getFaceById(id, pRec) : status | slot
+
+'' Fill the caller's spatial_result_t at pRec with the first face matching id.
+'' -- E_OK on success, E_MODE wrong mode, E_NOTFOUND no such id, E_NAK bus failure
+
+  status := guardMode(FUNC_FACE)
+  if status == E_OK
+    slot := findIdSlot(IDLIST_OFFS_FACE, IDLIST_CAP, id, 0)
+    if slot < 0
+      status := E_NOTFOUND
+    else
+      status := fetchRecord(BASE_FACE, slot, STRIDE_BOX, pRec, SIZEOF(spatial_result_t))
+
+
+pub getUnlearnedFace(index, pRec) : status | slot
+
+'' Fill the caller's spatial_result_t at pRec with the index-th (0-based) unlearned face.
+'' -- E_OK, E_ARG (index < 0), E_MODE, E_NOTFOUND (fewer than index+1 unlearned), E_NAK
+
+  status := E_ARG
+  if index >= 0
+    status := guardMode(FUNC_FACE)
+    if status == E_OK
+      ' FIX (vendor bug 3, WonderCam.cpp getFaceOfIndex): the vendor did `--index; if(index==0)`
+      ' which is 1-based and mishandles index 0. We select the index-th (0-based) unlearned face.
+      slot := findIdSlot(IDLIST_OFFS_FACE, IDLIST_CAP, FACE_ID_UNLEARNED, index)
+      if slot < 0
+        status := E_NOTFOUND
+      else
+        status := fetchRecord(BASE_FACE, slot, STRIDE_BOX, pRec, SIZEOF(spatial_result_t))
+
+
+pub anyObject() : bFlag
+
+'' TRUE if the latched object summary reports one or more objects (FALSE if not in object mode).
+
+  bFlag := anyDetectedIn(FUNC_OBJECT)
+
+
+pub numObjects() : countOrErr
+
+'' Total detected objects, or E_MODE if object mode is not active.
+
+  countOrErr := numDetectedIn(FUNC_OBJECT)
+
+
+pub objectIdDetected(id) : bFlag
+
+'' TRUE if an object with the given id is in the latched results (FALSE if not in object mode).
+
+  bFlag := FALSE
+  if modeActive == FUNC_OBJECT
+    bFlag := findIdSlot(IDLIST_OFFS_OTHER, IDLIST_CAP, id, 0) >= 0
+
+
+pub numObjectsOfId(id) : countOrErr
+
+'' Count of detected objects bearing id, or E_MODE if object mode is not active.
+
+  countOrErr := E_MODE
+  if modeActive == FUNC_OBJECT
+    countOrErr := countIdMatches(IDLIST_OFFS_OTHER, IDLIST_CAP, id)
+
+
+pub getObject(id, index, pRec) : status | slot
+
+'' Fill the caller's spatial_result_t at pRec with the index-th (0-based) object matching id.
+'' -- E_OK, E_ARG (index < 0), E_MODE, E_NOTFOUND, E_NAK
+
+  status := E_ARG
+  if index >= 0
+    status := guardMode(FUNC_OBJECT)
+    if status == E_OK
+      ' FIX (vendor bug 2, WonderCam.cpp objDetected): the vendor checked `if(index==0)` OUTSIDE
+      ' the id-match block and had no return after the loop (ran off the end -> undefined). We
+      ' select the index-th (0-based) matching record and always return a defined status.
+      slot := findIdSlot(IDLIST_OFFS_OTHER, IDLIST_CAP, id, index)
+      if slot < 0
+        status := E_NOTFOUND
+      else
+        status := fetchRecord(BASE_OBJECT, slot, STRIDE_BOX, pRec, SIZEOF(spatial_result_t))
+
+
+pub anyColor() : bFlag
+
+'' TRUE if the latched color summary reports one or more colors (FALSE if not in color mode).
+
+  bFlag := anyDetectedIn(FUNC_COLOR)
+
+
+pub numColors() : countOrErr
+
+'' Number of detected colors, or E_MODE if color mode is not active.
+
+  countOrErr := numDetectedIn(FUNC_COLOR)
+
+
+pub colorIdDetected(id) : bFlag
+
+'' TRUE if a color with the given id is in the latched results (FALSE if not in color mode).
+
+  bFlag := FALSE
+  if modeActive == FUNC_COLOR
+    bFlag := findIdSlot(IDLIST_OFFS_OTHER, liveScan(), id, 0) >= 0
+
+
+pub getColor(id, pRec) : status | slot
+
+'' Fill the caller's spatial_result_t at pRec with the color matching id.
+'' -- E_OK, E_MODE, E_NOTFOUND, E_NAK
+
+  status := guardMode(FUNC_COLOR)
+  if status == E_OK
+    slot := findIdSlot(IDLIST_OFFS_OTHER, liveScan(), id, 0)
+    if slot < 0
+      status := E_NOTFOUND
+    else
+      status := fetchRecord(BASE_COLOR, slot, STRIDE_BOX, pRec, SIZEOF(spatial_result_t))
+
+
+pub anyLine() : bFlag
+
+'' TRUE if the latched line summary reports one or more lines (FALSE if not in line mode).
+
+  bFlag := anyDetectedIn(FUNC_LINE)
+
+
+pub numLines() : countOrErr
+
+'' Number of detected lines, or E_MODE if line mode is not active.
+
+  countOrErr := numDetectedIn(FUNC_LINE)
+
+
+pub lineIdDetected(id) : bFlag
+
+'' TRUE if a line with the given id is in the latched results (FALSE if not in line mode).
+
+  bFlag := FALSE
+  if modeActive == FUNC_LINE
+    bFlag := findIdSlot(IDLIST_OFFS_OTHER, liveScan(), id, 0) >= 0
+
+
+pub getLine(id, pRec) : status | slot, angle, offset
+
+'' Fill the caller's line_result_t at pRec with the line matching id: raw endpoints, plus
+'' angle and offset NORMALIZED as the vendor does (kept open for bring-up, theory 5.6).
+'' -- E_OK, E_MODE, E_NOTFOUND, E_NAK
+
+  status := guardMode(FUNC_LINE)
+  if status == E_OK
+    slot := findIdSlot(IDLIST_OFFS_OTHER, liveScan(), id, 0)
+    if slot < 0
+      status := E_NOTFOUND
+    else
+      status := fetchRecord(BASE_LINE, slot, STRIDE_BOX, pRec, SIZEOF(line_result_t))
+      if status == E_OK
+        ' Normalize angle/offset in place (vendor lineId): wrap angle into -90..+90, and
+        ' recenter offset to a signed deflection from the frame center. Endpoints stay raw.
+        angle := WORD[pRec + LINE_ANGLE] SIGNX 15
+        if angle > LINE_ANGLE_WRAP
+          angle -= LINE_ANGLE_PERIOD
+        WORD[pRec + LINE_ANGLE] := angle
+        offset := WORD[pRec + LINE_OFFSET] SIGNX 15
+        if offset < 0
+          offset := -offset                                    ' abs() (Spin2 || is logical-OR, not abs)
+        WORD[pRec + LINE_OFFSET] := offset - LINE_OFFSET_CENTER
+
+
+pub anyTag() : bFlag
+
+'' TRUE if the latched AprilTag summary reports one or more tags (FALSE if not in AprilTag mode).
+
+  bFlag := anyDetectedIn(FUNC_APRILTAG)
+
+
+pub numTags() : countOrErr
+
+'' Total detected AprilTags, or E_MODE if AprilTag mode is not active.
+
+  countOrErr := numDetectedIn(FUNC_APRILTAG)
+
+
+pub tagIdDetected(id) : bFlag
+
+'' TRUE if a tag with the given id is in the latched results (FALSE if not in AprilTag mode).
+
+  bFlag := FALSE
+  if modeActive == FUNC_APRILTAG
+    bFlag := findIdSlot(IDLIST_OFFS_OTHER, liveScan(), id, 0) >= 0
+
+
+pub numTagsOfId(id) : countOrErr
+
+'' Count of detected tags bearing id, or E_MODE if AprilTag mode is not active.
+
+  countOrErr := E_MODE
+  if modeActive == FUNC_APRILTAG
+    countOrErr := countIdMatches(IDLIST_OFFS_OTHER, liveScan(), id)
+
+
+pub getTag(id, index, pRec) : status | slot
+
+'' Fill the caller's tag_result_t at pRec with the index-th (0-based) tag matching id
+'' (x,y,w,h + 6 IEEE-754 float pose LONGs).
+'' -- E_OK, E_ARG (index < 0), E_MODE, E_NOTFOUND, E_NAK
+
+  status := E_ARG
+  if index >= 0
+    status := guardMode(FUNC_APRILTAG)
+    if status == E_OK
+      ' FIX (vendor bug 4, WonderCam.cpp tagId): vendor `--index; if(index==0)` is 1-based and
+      ' mishandles index 0 - we select the index-th (0-based) match.
+      slot := findIdSlot(IDLIST_OFFS_OTHER, liveScan(), id, index)
+      if slot < 0
+        status := E_NOTFOUND
+      else
+        ' FIX (vendor bug 5): vendor used stride 0x32 (=50, a hex/dec typo); the record stride
+        ' is TAG_REC_STRIDE (32).
+        status := fetchRecord(BASE_APRILTAG, slot, TAG_REC_STRIDE, pRec, SIZEOF(tag_result_t))
+
+
+con { high-level classification-style API (classification / feature / number / road-sign / QR / barcode) - spec FR-3 }
+
+  ' Classification-shaped modes report an argmax id plus a probability. Probability is returned as a
+  ' SCALED INTEGER in 0..PROB_DIVISOR (i.e. raw / 10000 gives 0.0..1.0); a negative value is an error
+  ' code (E_MODE wrong active mode, E_ARG bad id). Callers wanting a float compute
+  ' FLOAT(prob) /. FLOAT(PROB_DIVISOR). (Design note: integer keeps the driver float-free and lets the
+  ' return double as a value and an error code; switching to a float return is a localized change.)
+  ' Number and road-sign (landmark) have NO vendor C path - their read logic is authored from the
+  ' Python reference (recognition.py / sign_recognition.py) and is UNVERIFIED until bring-up Layer 5.
+
+
+pub classTopId() : idOrErr
+
+'' Most-probable image-classification id, or E_MODE if classification mode is not active.
+
+  idOrErr := topIdIn(FUNC_CLASSIFY)
+
+
+pub classTopProb() : probOrErr
+
+'' Top classification probability (scaled 0..PROB_DIVISOR), or E_MODE if not in classification mode.
+
+  probOrErr := topProbIn(FUNC_CLASSIFY)
+
+
+pub classProbOfId(id) : probOrErr
+
+'' Probability (scaled 0..PROB_DIVISOR) of classification id (1-based), or E_MODE / E_ARG.
+
+  probOrErr := probOfIdIn(FUNC_CLASSIFY, id, SUMM_SIZE_CLASS)
+
+
+pub featureTopId() : idOrErr
+
+'' Most-probable feature-learning id, or E_MODE if feature-learning mode is not active.
+
+  idOrErr := topIdIn(FUNC_FEATURE)
+
+
+pub featureTopProb() : probOrErr
+
+'' Top feature-learning probability (scaled 0..PROB_DIVISOR), or E_MODE if not in feature mode.
+
+  probOrErr := topProbIn(FUNC_FEATURE)
+
+
+pub featureProbOfId(id) : probOrErr
+
+'' Probability (scaled 0..PROB_DIVISOR) of feature id (1-based), or E_MODE / E_ARG.
+
+  probOrErr := probOfIdIn(FUNC_FEATURE, id, SUMM_SIZE_FEATURE)
+
+
+pub numberTopId() : idOrErr
+
+'' Most-probable recognized-number id, or E_MODE if number mode is not active.
+'' UNVERIFIED: authored from the Python reference, no vendor C path (bring-up L5).
+
+  idOrErr := topIdIn(FUNC_NUMBER)
+
+
+pub numberTopProb() : probOrErr
+
+'' Top number-recognition probability (scaled 0..PROB_DIVISOR), or E_MODE if not in number mode.
+'' UNVERIFIED: authored from the Python reference, no vendor C path (bring-up L5).
+
+  probOrErr := topProbIn(FUNC_NUMBER)
+
+
+pub landmarkTopId() : idOrErr
+
+'' Most-probable road-sign (landmark) id, or E_MODE if road-sign mode is not active.
+'' UNVERIFIED (bring-up L5): Python-only; the id alone may not distinguish "no sign" from sign id 1 -
+'' gate on landmarkTopProb() confidence and confirm the no-detection sentinel on real hardware.
+
+  idOrErr := topIdIn(FUNC_LANDMARK)
+
+
+pub landmarkTopProb() : probOrErr
+
+'' Top road-sign probability (scaled 0..PROB_DIVISOR), or E_MODE if not in road-sign mode.
+'' UNVERIFIED: authored from the Python reference, no vendor C path (bring-up L5).
+
+  probOrErr := topProbIn(FUNC_LANDMARK)
+
+
+pub qrDetected() : bFlag
+
+'' TRUE if a QR code is decoded in the latched results (FALSE if not in QR mode).
+
+  bFlag := anyDetectedIn(FUNC_QRCODE)
+
+
+pub qrLength() : lenOrErr
+
+'' Decoded QR payload length in bytes, or E_MODE if QR mode is not active.
+
+  lenOrErr := payloadLength(FUNC_QRCODE)
+
+
+pub qrData(pBuf) : status
+
+'' Copy the decoded QR payload into pBuf (provide a >= QR_DATA_MAX byte buffer; NOT null-terminated).
+'' -- returns the byte count copied (0 if empty), E_MODE wrong mode, or E_NAK bus failure
+
+  status := readPayload(FUNC_QRCODE, BASE_QRCODE, pBuf)
+
+
+pub barcodeDetected() : bFlag
+
+'' TRUE if a barcode is decoded in the latched results (FALSE if not in barcode mode).
+
+  bFlag := anyDetectedIn(FUNC_BARCODE)
+
+
+pub barcodeLength() : lenOrErr
+
+'' Decoded barcode payload length in bytes, or E_MODE if barcode mode is not active.
+
+  lenOrErr := payloadLength(FUNC_BARCODE)
+
+
+pub barcodeData(pBuf) : status
+
+'' Copy the decoded barcode payload into pBuf (provide a >= QR_DATA_MAX byte buffer; NOT null-terminated).
+'' -- returns the byte count copied (0 if empty), E_MODE wrong mode, or E_NAK bus failure
+
+  status := readPayload(FUNC_BARCODE, BASE_BARCODE, pBuf)
+
+
+pri writeToAddr(regAddr, pBuf, byteCount) : status
+
+'' Write byteCount bytes from pBuf to 16-bit device register regAddr.
+'' -- returns byteCount on success, or E_NAK if the device did not acknowledge
+
+  status := E_NAK
+  if addrWritePhase(regAddr) == i2c.ACK
+    if i2c.wr_block(pBuf, byteCount) == i2c.ACK
+      status := byteCount
+  i2c.stop()
+
+
+pri readFromAddr(regAddr, pBuf, byteCount) : status | remaining, chunk, pDest, nextAddr
+
+'' Read byteCount bytes from 16-bit device register regAddr into pBuf.
+'' -- CHUNK_AUTOINC TRUE  : one continuous sequential read (the normal I2C pattern)
+'' -- CHUNK_AUTOINC FALSE : re-address before each READ_CHUNK-byte chunk (hardware fallback)
+'' -- returns byteCount on success, or E_NAK if the device did not acknowledge
+
+  status := E_NAK
+  if CHUNK_AUTOINC
+    if startRead(regAddr) == i2c.ACK
+      i2c.rd_block(pBuf, byteCount, i2c.NAK)
+      status := byteCount
+    i2c.stop()
+  else
+    pDest     := pBuf
+    nextAddr  := regAddr
+    remaining := byteCount
+    status    := byteCount
+    repeat while remaining > 0
+      chunk := remaining <# READ_CHUNK
+      if startRead(nextAddr) <> i2c.ACK
+        status := E_NAK
+        i2c.stop()
+        quit
+      i2c.rd_block(pDest, chunk, i2c.NAK)
+      i2c.stop()
+      pDest     += chunk
+      nextAddr  += chunk
+      remaining -= chunk
+
+
+pri startRead(regAddr) : ackbit
+
+'' Address-write phase plus repeated start for a read from 16-bit register regAddr.
+'' -- returns i2c.ACK if the device acknowledged the read-address byte
+
+  ackbit := addrWritePhase(regAddr)
+  if ackbit == i2c.ACK
+    i2c.start()                                                ' repeated start into the read phase
+    ackbit := i2c.write(CAM_ADDR_RD)
+
+
+pri addrWritePhase(regAddr) : ackbit
+
+'' I2C start + device write-address + 16-bit register address (mid-transaction, no stop).
+'' -- returns i2c.ACK if the device acknowledged its write-address byte
+
+  i2c.start()
+  ackbit := i2c.write(CAM_ADDR_WR)
+  if ackbit == i2c.ACK
+    sendRegAddr(regAddr)
+
+
+pri sendRegAddr(regAddr)
+
+'' Write the 16-bit register address to the bus, byte order per ADDR_LOW_FIRST
+
+  if ADDR_LOW_FIRST
+    i2c.write(regAddr & $FF)                                   ' low byte first (code-confirmed default)
+    i2c.write((regAddr >> 8) & $FF)
+  else
+    i2c.write((regAddr >> 8) & $FF)                            ' high byte first (bring-up L1 alternative)
+    i2c.write(regAddr & $FF)
+
+
+pri summaryReadPlan(mode) : base, summSize
+
+'' Map an active function id to its result-region base address and updateResult() summary size.
+'' -- base 0 means "no result region" (FUNC_NONE or an unmapped id)
+'' Summary sizes mirror vendor updateResult() (WonderCam.cpp:512-549): classification 128,
+'' feature-learning 64, everything else 48.
+
+  summSize := SUMM_SIZE_STD                                   ' default for the box/payload modes
+  case mode
+    FUNC_FACE     : base := BASE_FACE
+    FUNC_OBJECT   : base := BASE_OBJECT
+    FUNC_CLASSIFY : base := BASE_CLASSIFY
+                    summSize := SUMM_SIZE_CLASS
+    FUNC_FEATURE  : base := BASE_FEATURE
+                    summSize := SUMM_SIZE_FEATURE
+    FUNC_COLOR    : base := BASE_COLOR
+    FUNC_LINE     : base := BASE_LINE
+    FUNC_APRILTAG : base := BASE_APRILTAG
+    FUNC_QRCODE   : base := BASE_QRCODE
+    FUNC_BARCODE  : base := BASE_BARCODE
+    FUNC_NUMBER   : base := BASE_NUMBER                        ' Python-only source - unverified (bring-up L5)
+    FUNC_LANDMARK : base := BASE_LANDMARK                      ' Python-only source - unverified (bring-up L5)
+                    ' summSize stays SUMM_SIZE_STD (48): the Python reference reads 48 for every mode, and
+                    ' only top-id/top-prob (bytes 0..3) are exposed; 128 would also overrun BASE_NUMBER's
+                    ' region (BASE_NUMBER and BASE_LANDMARK are only 128 bytes apart).
+    other         : base := 0                                 ' FUNC_NONE or unknown: caller treats as E_MODE
+
+
+pri guardMode(wantFunc) : status
+
+'' E_OK if the device's last-latched mode (set by updateResult/currentMode) is wantFunc, else E_MODE.
+'' The detection accessors read the cached summary, so they validate against the latched mode -
+'' they do NOT re-read REG_FUNC (that is updateResult's job, kept separate per spec FR-2).
+
+  status := E_MODE
+  if modeActive == wantFunc
+    status := E_OK
+
+
+pri findIdSlot(listOffs, scanCount, wantId, occurrence) : slot | idx, matchNum
+
+'' Scan scanCount id-list bytes from summBuffer[listOffs] for the occurrence-th (0-based) entry
+'' equal to wantId. Returns its id-list position (the detail-record slot), or -1 if there are
+'' fewer than occurrence+1 matches. A while-loop (not repeat-from) so scanCount == 0 scans nothing.
+
+  slot     := -1
+  matchNum := 0
+  idx      := 0
+  repeat while idx < scanCount
+    if summBuffer[listOffs + idx] == wantId
+      if matchNum == occurrence
+        slot := idx
+        quit
+      matchNum++
+    idx++
+
+
+pri countIdMatches(listOffs, scanCount, wantId) : count | idx
+
+'' Count id-list bytes equal to wantId across scanCount entries from summBuffer[listOffs].
+
+  count := 0
+  idx   := 0
+  repeat while idx < scanCount
+    if summBuffer[listOffs + idx] == wantId
+      count++
+    idx++
+
+
+pri liveScan() : scanCount
+
+'' id-list length for the count-driven modes (color/line/tag): the latched detection count,
+'' bounded by the id-list capacity.
+
+  scanCount := summBuffer[SUMM_COUNT] <# IDLIST_CAP
+
+
+pri fetchRecord(base, slot, stride, pRec, recLen) : status
+
+'' Read a recLen-byte detail record (record slot at base + DETAIL_OFFS + slot*stride) into pRec.
+'' Normalizes the transport's positive byte count to E_OK; a transport E_NAK passes through.
+
+  status := readFromAddr(base + DETAIL_OFFS + slot * stride, pRec, recLen)
+  if status >= E_OK
+    status := E_OK
+
+
+pri anyDetectedIn(wantFunc) : bFlag
+
+'' TRUE if wantFunc is the latched mode and its summary count is nonzero, else FALSE.
+'' Shared body of the any* predicates (count-header modes: face/object/color/line/tag).
+
+  bFlag := FALSE
+  if modeActive == wantFunc
+    bFlag := summBuffer[SUMM_COUNT] > 0
+
+
+pri numDetectedIn(wantFunc) : countOrErr
+
+'' Latched summary detection count for wantFunc, or E_MODE if it is not the active mode.
+'' Shared body of the num* counts (count-header modes).
+
+  countOrErr := E_MODE
+  if modeActive == wantFunc
+    countOrErr := summBuffer[SUMM_COUNT]
+
+
+pri summWord(offset) : value
+
+'' Unsigned 16-bit little-endian value from the latched summary at byte offset.
+'' (P2 is little-endian and the device payload is little-endian, so WORD reads it directly.)
+
+  value := WORD[@summBuffer + offset]
+
+
+pri topIdIn(wantFunc) : idOrErr
+
+'' Argmax id from the latched classification-style summary, or E_MODE if wantFunc is not active.
+
+  idOrErr := E_MODE
+  if modeActive == wantFunc
+    idOrErr := summBuffer[SUMM_CLASS_TOPID]
+
+
+pri topProbIn(wantFunc) : probOrErr
+
+'' Top probability for wantFunc as a scaled integer 0..PROB_DIVISOR (divide by PROB_DIVISOR for
+'' 0.0..1.0), or E_MODE if wantFunc is not active.
+
+  probOrErr := E_MODE
+  if modeActive == wantFunc
+    probOrErr := summWord(SUMM_CLASS_PROB)
+
+
+pri probOfIdIn(wantFunc, id, summSize) : probOrErr | offset
+
+'' Probability of a specific id (1-based) from the per-id table, as a scaled integer
+'' 0..PROB_DIVISOR. E_MODE if wantFunc is not active; E_ARG if id < 1 or its table entry would
+'' fall outside the latched summary (summSize bounds it: classification 128, feature 64).
+
+  probOrErr := E_MODE
+  if modeActive == wantFunc
+    probOrErr := E_ARG
+    if id >= 1
+      offset := PERID_TABLE_OFFS + (id - 1) * PERID_STRIDE
+      if offset + 2 <= summSize
+        probOrErr := summWord(offset)
+
+
+pri payloadLength(wantFunc) : lenOrErr
+
+'' QR/barcode payload length (uint16 LE at QR_LEN_OFFS) from the latched summary, or E_MODE.
+
+  lenOrErr := E_MODE
+  if modeActive == wantFunc
+    lenOrErr := summWord(QR_LEN_OFFS)
+
+
+pri readPayload(wantFunc, base, pBuf) : status | len
+
+'' Read a QR/barcode payload into pBuf: length from the latched summary, then that many bytes
+'' (clamped to QR_DATA_MAX) from base + QR_DATA_OFFS. Returns the byte count read (0 for an empty
+'' payload), E_MODE if wantFunc is not active, or E_NAK on bus failure.
+
+  status := guardMode(wantFunc)
+  if status == E_OK
+    len    := summWord(QR_LEN_OFFS) <# QR_DATA_MAX
+    status := 0                                                ' empty payload reads zero bytes (still success)
+    if len > 0
+      status := readFromAddr(base + QR_DATA_OFFS, pBuf, len)   ' spans 32-byte chunks via CHUNK_AUTOINC
+
+
+con { license }
+
+{{
+ -------------------------------------------------------------------------------------------------
+  MIT License
+
+  Copyright (c) 2026 Iron Sheep Productions, LLC
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+ =================================================================================================
+}}

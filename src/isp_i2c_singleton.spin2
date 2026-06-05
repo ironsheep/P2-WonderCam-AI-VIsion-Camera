@@ -1,0 +1,435 @@
+{Spin2_v46}                                                    ' enables channel-based DEBUG[n]() / DEBUG_MASK
+'' =================================================================================================
+''
+''   File....... isp_i2c_singleton.spin2
+''   Purpose.... Low-level I2C routines for the P2
+''   Author..... Stephen M Moraco adapts jm_i2c.spin2 to be a singleton object
+''               Copyright (c) 2021 Stephen M Moraco
+''               -- see below for terms of use
+''   E-mail..... stephen@ironsheep.biz
+''   Started.... 28 Jun 2021
+''   Updated.... 14 Aug 2021
+''
+'' =================================================================================================
+
+' Note: The pin modes drive the high output through a resistor; this simulates the use of a pull-up
+'       on the pin.
+'
+' Note: Support for clock-stretching removed due to lack of use in nearly all devices
+
+
+con { fixed io pins }
+
+  RX1      = 63  { I }                                          ' programming / debug
+  TX1      = 62  { O }
+
+  SF_CS    = 61  { O }                                          ' serial flash
+  SF_SCK   = 60  { O }
+  SF_SDO   = 59  { O }
+  SF_SDI   = 58  { I }
+
+
+con
+
+  #0, PU_NONE, PU_1K5, PU_3K3, PU_15K                           ' pull-up options
+  #0, ACK, NAK
+
+  STRETCH_LIMIT = 4_000_000                                     ' max clock-stretch spin iterations in read() (~tens of ms) before giving up
+
+  #0, MK_NOTHING, MK_START, MK_WRITE, MK_READ, MK_STOP, MK_SDA, MK_SCL
+
+  MAX_LOG_ENTRIES = 30
+
+  ' ---- channel-based DEBUG (Spin2 v46+) ----------------------------------------------------------
+  ' DEBUG_MASK chooses which DEBUG[n]() channels are COMPILED. A clear bit emits no code at all, so
+  ' the shipped default (0) has zero overhead. The bus trace is buffered cheaply by record() during a
+  ' transaction and only printed by report() at stop(), so DEBUG never sits in the timing-critical
+  ' inline-PASM path. To trace I2C activity, change the one line below to:
+  '     DEBUG_MASK = (1 << DBG_I2C)
+  DBG_I2C       = 0                                             ' I2C bus trace -> DEBUG channel 0
+  DEBUG_MASK    = 0                                             ' ship default: all channels off
+  I2C_DEBUG     = (DEBUG_MASK >> DBG_I2C) & 1                   ' 1 when the DBG_I2C channel is enabled
+
+DAT
+    ' following 3 LONGs must stay in this position relative to each other!
+sclpin        long      0                               ' i2c bus pins
+sdapin        long      0
+clktix        long      0                               ' system ticks in 1/4 period
+
+dbgStretchTO  long      0                               ' bring-up: 1 if the last read() stretch wait timed out
+
+' for debug dumps
+logBytes      WORD      0[MAX_LOG_ENTRIES]
+entryCount    WORD      0
+
+pub null()
+
+'' This is not a top-level object
+
+PRI record(mode, value)
+    if I2C_DEBUG
+        if entryCount < MAX_LOG_ENTRIES - 1
+            WORD [@logBytes][entryCount] := (mode & $ff) << 8 | (value & $ff)
+            entryCount++
+
+PRI report() | bytIndex, mode, value
+    if I2C_DEBUG
+        if entryCount > 0
+            repeat bytIndex from 0 to entryCount - 1
+                mode := WORD [@logBytes][bytIndex] >> 8
+                value := WORD [@logBytes][bytIndex] & $ff
+                case mode
+                    MK_START:
+                        debug[DBG_I2C]("  start()")
+                    MK_WRITE:
+                        debug[DBG_I2C]("  write(0x", uhex_byte_(value), ")")
+                    MK_READ:
+                        debug[DBG_I2C]("  read(0x", uhex_byte_(value), ")")
+                    MK_STOP:
+                        debug[DBG_I2C]("  stop()")
+                    MK_SCL:
+                        debug[DBG_I2C]("  SCL=", udec_(value))
+                    MK_SDA:
+                        debug[DBG_I2C]("  SDA=", udec_(value))
+                    other:
+                        debug[DBG_I2C]("  {unknown??}")
+            entryCount := 0
+
+pub quiesce(pScl, pSda, pullup) | scl, sda
+
+'' Define I2C SCL (clock) and SDA (data) pins
+'' -- pullup controls high level drive configuration of SCL and SDA
+  sdapin := pSda
+  sclpin := pScl
+
+  'longmove(@scl, @sclpin, 2)
+  scl := sclpin
+  sda := sdapin
+
+  case pullup
+    PU_NONE : pullup := P_HIGH_FLOAT                            ' use external pull-up
+    PU_1K5  : pullup := P_HIGH_1K5                              ' 1.5k
+    PU_3K3  : pullup := P_HIGH_1MA                              ' acts like ~3.3k
+    other   : pullup := P_HIGH_15K                              ' 15K
+
+  org
+                wrpin     pullup, scl                           ' configure high drive
+                drvl      scl                                   ' clock low, LA triggers off of clock
+  end
+
+
+pub setup(pScl, pSda, khz, pullup) | scl, sda, tix
+
+  entryCount := 0
+
+'' Define I2C SCL (clock) and SDA (data) pins
+'' -- khz is bus frequency: 100 (standard), 400 (full), 1000 (fast)
+''    * circuit/connections will affect maximum bus speed
+'' -- pullup controls high level drive configuration of SCL and SDA
+
+  clktix := tix := (clkfreq / (khz * 1_000)) >> 2               ' calculate ticks in 1/4 period
+  sdapin := pSda
+  sclpin := pScl
+  'longmove(@scl, @sclpin, 2)
+  scl := sclpin
+  sda := sdapin
+  tix := clktix
+
+  case pullup
+    PU_NONE : pullup := P_HIGH_FLOAT                            ' use external pull-up
+    PU_1K5  : pullup := P_HIGH_1K5                              ' 1.5k
+    PU_3K3  : pullup := P_HIGH_1MA                              ' acts like ~3.3k
+    other   : pullup := P_HIGH_15K                              ' 15K
+
+  org
+                fltl      scl                                   ' clear old smart pin setup
+                fltl      sda
+                wrpin     pullup, scl                           ' configure high drive
+                wrpin     pullup, sda
+                drvh      scl                                   ' both high
+                drvh      sda
+                waitx     tix
+                waitx     tix
+
+                rep       #8, #9                                ' bus clear (if SDA stuck low)
+                 testp    sda                           wc      ' sample sda
+    if_c         jmp      #.done                                ' abort loop if sda == 1
+                 drvl     scl                                   ' scl low
+                 waitx    tix
+                 waitx    tix
+                 drvh     scl                                   ' scl high
+                 waitx    tix
+                 waitx    tix
+.done
+  end
+
+
+pub present(devid) : result
+
+'' Pings device, returns true if device on bus.
+
+  start()
+
+  result := (write(devid) == ACK)
+
+
+pub wait(devid) | ackbit
+
+'' Waits for device to be ready for new command.
+'' -- Note: Use present() to detect device before using wait()
+
+  repeat
+    start()
+    ackbit := write(devid)
+  until (ackbit == ACK)
+
+
+pub start() | scl, sda, tix, tmo
+
+'' Create I2C (or repeated-) start sequence
+'' -- honors clock-stretching: after releasing SCL high, waits (bounded) until SCL actually reads
+''    high before forming the START.  Critical for the repeated-START of a register read: the
+''    DF2301Q holds SCL low after the register-pointer write, so without this wait the START
+''    condition never forms and the read half never reaches the bus.
+
+  scl := sclpin
+  sda := sdapin
+  tix := clktix
+  record(MK_START, 0)
+
+  org
+                drvh      sda                                   ' both high
+                drvh      scl                                   ' release scl
+                mov       tmo, ##STRETCH_LIMIT                  ' clock-stretch: wait for scl to truly rise
+.st_wait        testp     scl                           wc
+        if_c    jmp       #.st_go
+                djnz      tmo, #.st_wait
+.st_go          waitx     tix
+
+                drvl      sda                                   ' start sequence (SDA falls while SCL high)
+                waitx     tix
+
+                drvl      scl
+                waitx     tix
+  end
+
+pub write(i2cbyte) : ackbit | scl, sda, tix
+
+'' Write byte to I2C bus
+'' -- leaves SCL low
+
+  'longmove(@scl, @sclpin, 2)
+  scl := sclpin
+  sda := sdapin
+  tix := clktix
+  record(MK_WRITE, i2cbyte)
+
+  org
+                shl       i2cbyte, #24                          ' align i2cbyte.[7] to i2cbyte.[31]
+
+.wr_byte        rep       #8, #8                                ' output 8 bits, msbfirst
+                 shl      i2cbyte, #1                   wc      ' msb --> c
+                 drvc     sda                                   ' c -- sda
+                 waitx    tix                                   ' let sda settle
+                 drvh     scl                                   ' scl high
+                 waitx    tix
+                 waitx    tix
+                 drvl     scl                                   ' scl low
+                 waitx    tix
+
+.get_ack        drvh      sda                                   ' pull-up sda
+                waitx     tix
+                drvh      scl                                   ' scl high
+                waitx     tix
+                testp     sda                           wc      ' sample sda (ack bit)
+                muxc      ackbit, #1                            ' update return value
+                waitx     tix
+                drvl      scl                                   ' scl low
+                waitx     tix
+                waitx     tix
+  end
+
+
+pub wr_block(p_block, count) : ackbit | i2cbyte, scl, sda, tix
+
+'' Write count bytes from p_block to I2C bus
+'' -- p_block is pointer to bytes
+'' -- leaves SCL low
+
+  'longmove(@scl, @sclpin, 2)
+  scl := sclpin
+  sda := sdapin
+  tix := clktix
+
+  org
+.get_byte       rdbyte    i2cbyte, p_block                      ' read byte from block
+                add       p_block, #1                           ' increment block pointer
+                shl       i2cbyte, #24                          ' align i2cbyte.[7] to i2cbyte.[31]
+
+.wr_byte        rep       #8, #8                                ' output 8 bits, msbfirst
+                 shl      i2cbyte, #1                   wc      ' msb --> c
+                 drvc     sda                                   ' c -- sda
+                 waitx    tix                                   ' let sda settle
+                 drvh     scl                                   ' scl high
+                 waitx    tix
+                 waitx    tix
+                 drvl     scl                                   ' scl low
+                 waitx    tix
+
+.get_ack        drvh      sda                                   ' pull-up sda
+                waitx     tix
+                drvh      scl                                   ' scl high
+                waitx     tix
+                testp     sda                           wc      ' sample sda (ack bit)
+    if_c        or        ackbit, #1                            ' update return value
+                waitx     tix
+                drvl      scl                                   ' scl low
+                waitx     tix
+                waitx     tix
+
+                djnz      count, #.get_byte
+  end
+
+
+pub read(ackbit) : i2cbyte | scl, sda, tix, cnt, tmo
+
+'' Read byte from I2C bus
+'' -- ackbit is state of ack bit (usually NAK for last byte read)
+'' -- honors clock-stretch: per data bit, release SCL then wait (bounded) for it to actually rise
+''    before sampling.  The DF2301Q holds SCL low while it produces read data.
+
+  'longmove(@scl, @sclpin, 2)
+  scl := sclpin
+  sda := sdapin
+  tix := clktix
+
+  org
+                drvh      sda                                   ' release sda (open-drain, pull-up)
+                mov       cnt, #8                               ' read 8 bits, msb first
+
+.rd_byte        waitx     tix
+                drvh      scl                                   ' release scl high
+                mov       tmo, ##STRETCH_LIMIT
+.rd_wait        testp     scl                           wc      ' clock-stretch: wait until scl truly high
+        if_c    jmp       #.rd_smp
+                djnz      tmo, #.rd_wait
+.rd_smp         waitx     tix
+                testp     sda                           wc      ' sample sda
+                shl       i2cbyte, #1                           ' make room for new bit
+                muxc      i2cbyte, #1                           ' sda --> i2cbyte.[0]
+                waitx     tix
+                drvl      scl                                   ' scl low
+                waitx     tix
+                djnz      cnt, #.rd_byte
+
+.put_ack        testb     ackbit, #0                    wc      ' ackbit.[0] --> c
+                drvc      sda                                   ' c --> sda
+                waitx     tix                                   ' let sda settle
+                drvh      scl                                   ' scl high
+                waitx     tix
+                waitx     tix
+                drvl      scl                                   ' scl low
+                waitx     tix
+                waitx     tix
+  end
+  record(MK_READ, i2cbyte)
+
+
+pub rd_block(p_block, count, ackbit) | i2cbyte, scl, sda, tix
+
+'' Read count bytes from I2C bus
+'' -- p_block is pointer to storage location for bytes
+'' -- ackbit is state of ack for final byte read
+
+  'longmove(@scl, @sclpin, 2)
+  scl := sclpin
+  sda := sdapin
+  tix := clktix
+
+
+  org
+.rd_block       drvh      sda                                   ' pull-up sda
+                mov       i2cbyte, #0                           ' clear workspace
+
+.rd_byte        rep       #9, #8                                ' read 8 bits, msb first
+                 waitx    tix
+                 drvh     scl                                   ' scl high
+                 waitx    tix
+                 testp    sda                           wc      ' sample sda
+                 shl      i2cbyte, #1                           ' make room for new bit
+                 muxc     i2cbyte, #1                           ' sda --> i2cbyte.[0]
+                 waitx    tix
+                 drvl     scl                                   ' scl low
+                 waitx    tix
+
+.put_ack        cmp       count, #1                     wz      ' last byte?
+    if_nz       drvl      sda                                   ' 0 --> sda (ack) if not last byte
+    if_z        testb     ackbit, #0                    wc      ' last byte, ackbit.[0] --> c
+    if_z        drvc      sda                                   ' last byte, c --> sda
+                waitx     tix                                   ' let sda settle
+                drvh      scl                                   ' scl high
+                waitx     tix
+                waitx     tix
+                drvl      scl                                   ' scl low
+                waitx     tix
+                waitx     tix
+
+.put_byte       wrbyte    i2cbyte, p_block                      ' write byte to block
+                add       p_block, #1                           ' increment block pointer
+
+                djnz      count, #.rd_block
+  end
+
+
+pub stop() | scl, sda, tix, tmo
+
+'' Create I2C stop sequence
+'' -- honors clock-stretch: waits (bounded) for SCL to actually rise before raising SDA, so the
+''    STOP condition forms even when the slave is holding SCL low after the final ACK
+
+  scl := sclpin
+  sda := sdapin
+  tix := clktix
+  record(MK_STOP, 0)
+
+  org
+                drvl      sda                                   ' hold sda low
+                drvh      scl                                   ' release scl
+                mov       tmo, ##STRETCH_LIMIT                  ' clock-stretch: wait for scl high
+.sp_wait        testp     scl                           wc
+        if_c    jmp       #.sp_go
+                djnz      tmo, #.sp_wait
+.sp_go          waitx     tix
+                drvh      sda                                   ' finish stop sequence (SDA rises while SCL high)
+                waitx     tix                                   ' bus-free time before the next start
+  end
+  report()
+
+
+CON { license }
+
+{{
+ -------------------------------------------------------------------------------------------------
+  MIT License
+
+  Copyright (c) 2021 Iron Sheep Productions, LLC
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+ =================================================================================================
+}}
