@@ -225,4 +225,9 @@ REF-NO-COMMIT/
 .devcontainer/pnut-ts-linux-arm64-015500.zip
 .devcontainer/docker-compose.override.yml
 /.devcontainer/.history
-/.claude
+# .claude/: track project methodology config, ignore local/transient content
+.claude/*
+!.claude/skill-conventions.md
+!.claude/skills/
+.claude/skills/*/*
+!.claude/skills/*/project-overlay.md
